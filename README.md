@@ -28,10 +28,6 @@
 - [🔍 Cách hoạt động](#-cách-hoạt-động)
 - [🧠 Kiến trúc hệ thống](#-kiến-trúc-hệ-thống)
 - [⚠️ Rủi ro & Lưu ý](#️-rủi-ro--lưu-ý)
-- [❓ FAQ](#-faq)
-- [🛣️ Roadmap](#️-roadmap)
-- [🤝 Đóng góp](#-đóng-góp)
-- [📄 Giấy phép](#-giấy-phép)
 - [📞 Liên hệ](#-liên-hệ)
 
 ---
@@ -130,33 +126,31 @@ Có khả năng bị giới hạn hoặc khóa tài khoản
 Dùng với mục đích học tập / nghiên cứu
 
 👉 Bạn tự chịu trách nhiệm khi sử dụng
+---
 
-❓ FAQ
+## 🛣️ Roadmap
 
-Q: Có an toàn không?
-A: Dùng API thật nhưng vẫn có rủi ro nếu lạm dụng
+Dự án vẫn đang phát triển và sẽ được nâng cấp thêm:
 
-Q: Tại sao có delay?
-A: Tránh bị detect là bot
+- [ ] Hỗ trợ Firefox (WebExtension API)
+- [ ] Multi-account (chạy nhiều tài khoản cùng lúc)
+- [ ] Proxy integration (tránh bị rate limit)
+- [ ] Dashboard thống kê điểm (UI riêng)
+- [ ] Auto scheduler (chạy theo giờ định sẵn)
+- [ ] Log system (ghi lại hoạt động chi tiết)
 
-Q: Firefox có dùng được không?
-A: Chưa, nhưng có thể thêm sau
+---
 
-🛣️ Roadmap
- Hỗ trợ Firefox
- Multi-account
- Proxy support
- Dashboard thống kê
- Auto schedule chạy nền
-🤝 Đóng góp
-Fork repo
-Tạo branch
-Commit
-Push
-Pull Request
-📄 Giấy phép
+## 🤝 Đóng góp
 
-MIT License
+Mọi đóng góp đều được hoan nghênh.
+
+Cách tham gia:
+
+1. Fork repository  
+2. Tạo branch mới  
+   ```bash
+   git checkout -b feature/ten-tinh-nang
 
 📞 Liên hệ
 👨‍💻 GitHub: https://github.com/buoi2k7
