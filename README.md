@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://github.com/fluidicon.png" width="120" alt="Logo">
+  <img src="https://raw.githubusercontent.com/buoi2k7/Reward_Bing_VN/main/extension/icons/icon-128.png" width="120" alt="Extension Icon">
   <h1>Microsoft Rewards Auto (API Edition)</h1>
   <p><b>Công cụ tự động hóa thu thập điểm Microsoft Rewards bằng cách gọi API trực tiếp, không phụ thuộc vào thay đổi giao diện.</b></p>
 </div>
