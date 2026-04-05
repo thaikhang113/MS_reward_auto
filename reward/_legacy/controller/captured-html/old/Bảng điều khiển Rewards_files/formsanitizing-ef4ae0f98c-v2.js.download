@@ -1,0 +1,1 @@
+function onSendFeedback(){var e=document.getElementById("fbpgdgtx");e.value=HtmlSanitizer.SanitizeHtml(e.value)}
