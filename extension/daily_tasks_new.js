@@ -1,68 +1,162 @@
+const TASK_URL_BLACKLIST = ['referandearn', 'explore', 'edge', 'install', 'app', 'purchase'];
+const REWARDS_PATH_BLACKLIST = new Set(['/', '/welcome', '/pointsbreakdown', '/starbonusdistribution']);
+
+function normalizeTaskUrl(rawUrl) {
+  if (typeof rawUrl !== 'string') return null;
+
+  const trimmedUrl = rawUrl.trim();
+  if (!trimmedUrl || trimmedUrl.startsWith('/')) return null;
+
+  try {
+    const parsedUrl = new URL(trimmedUrl);
+    const protocol = parsedUrl.protocol.toLowerCase();
+    const host = parsedUrl.hostname.toLowerCase();
+    const path = (parsedUrl.pathname.replace(/\/+$/, '') || '/').toLowerCase();
+
+    if (protocol !== 'http:' && protocol !== 'https:') return null;
+    if (TASK_URL_BLACKLIST.some((keyword) => parsedUrl.href.toLowerCase().includes(keyword))) return null;
+
+    if (host === 'rewards.bing.com') {
+      if (REWARDS_PATH_BLACKLIST.has(path) || path.startsWith('/dashboard')) {
+        return null;
+      }
+    }
+
+    parsedUrl.hash = '';
+    return parsedUrl.toString();
+  } catch (e) {
+    return null;
+  }
+}
+
+function getTaskDedupKey(url) {
+  try {
+    const parsedUrl = new URL(url);
+    const host = parsedUrl.hostname.toLowerCase();
+    const path = parsedUrl.pathname.toLowerCase();
+
+    if ((host === 'www.bing.com' || host === 'bing.com') && path === '/search') {
+      const query = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
+      if (query) return `${host}${path}?q=${query}`;
+    }
+
+    return `${host}${path}${parsedUrl.search}`;
+  } catch (e) {
+    return url;
+  }
+}
+
+function isBlockedTaskUrl(url) {
+  return !normalizeTaskUrl(url);
+}
+
+function scanUncompletedTasks(dashboard) {
+  const uniqueUrls = new Map();
+  const visited = new WeakSet();
+
+  const toNumber = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const isTaskIncomplete = (task) => {
+    const maxProgress = toNumber(task.pointProgressMax);
+
+    if (maxProgress !== null) {
+      // Punch cards can be partially completed (for example 1/10), so progress wins.
+      const currentProgress = Math.max(0, toNumber(task.pointProgress) ?? 0);
+      return currentProgress < maxProgress;
+    }
+
+    if (typeof task.complete === 'boolean') {
+      return task.complete === false;
+    }
+
+    if (typeof task.complete === 'string') {
+      return task.complete.toLowerCase() === 'false';
+    }
+
+    // Ignore wrapper nodes that carry a URL but no completion state.
+    return false;
+  };
+
+  const visit = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(node, 'destinationUrl')) {
+      const url = normalizeTaskUrl(node.destinationUrl);
+
+      if (url && isTaskIncomplete(node)) {
+        uniqueUrls.set(getTaskDedupKey(url), url);
+      }
+
+      // Stop here on purpose to avoid re-reading duplicated promo metadata.
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      visit(value);
+    }
+  };
+
+  visit(dashboard);
+  return [...uniqueUrls.values()];
+}
+
 export async function runDailyTasks() {
-  log(`[Daily Tasks] Bắt đầu tự động làm nhiệm vụ hàng ngày...`);
-  let tabId = null;
+  log('[Daily Tasks] Starting daily task automation...');
   let totalCompleted = 0;
   let apiUrls = [];
 
   try {
-    // 🔥 TẢI DỮ LIỆU SUPER ACCURATE JSON QUA API (Ẩn hoàn toàn khỏi giao diện)
-    log('🤖 [API] Đang tải Database JSON cực kỳ chính xác từ Microsoft Server...');
-    const apiRes = await fetch("https://rewards.bing.com/api/getuserinfo?type=1");
+    log('[API] Loading rewards dashboard JSON from Microsoft...');
+    const apiRes = await fetch('https://rewards.bing.com/api/getuserinfo?type=1');
+
     if (apiRes.ok) {
       const dbData = await apiRes.json();
       const dashboard = dbData.dashboard || {};
-
-      const extractTasks = (promoList) => {
-        if (!promoList) return;
-        for (const task of promoList) {
-          if (!task.complete && task.destinationUrl && !task.destinationUrl.includes('referandearn')) {
-            apiUrls.push(task.destinationUrl);
-          }
-        }
-      };
-
-      // 1. Quét Daily Set
-      extractTasks(dashboard.dailySetPromotions);
-      // 2. Quét More Promotions (Keep Earning)
-      extractTasks(dashboard.morePromotions);
-      // 3. Quét PunchCards (Quests đa bước)
-      if (dashboard.punchCards) {
-        dashboard.punchCards.forEach(pc => {
-          if (pc.parentPromotion && pc.parentPromotion.promotions) {
-            extractTasks(pc.parentPromotion.promotions);
-          }
-        });
-      }
-
-      // Khử trùng lặp URL
-      apiUrls = [...new Set(apiUrls)];
-      log(`🔥 [API] Thành công! Tìm thấy chính xác ${apiUrls.length} nhiệm vụ cần làm.`);
+      apiUrls = scanUncompletedTasks(dashboard);
+      log(`[API] Found ${apiUrls.length} pending task URLs.`);
     }
   } catch (e) {
-    log(`[API Error] Lỗi khi kéo Database: ${e.message}`);
+    log(`[API Error] ${e.message}`);
   }
 
   try {
     if (apiUrls.length > 0) {
-      // ═══════════════════════════════════════════════════════
-      // PHASE 1: TỰ ĐỘNG MỞ URL ĐƯỢC CHỈ ĐỊNH TỪ JSON API
-      // ═══════════════════════════════════════════════════════
-      log(`[API Task] Bắt đầu xử lý ${apiUrls.length} nhiệm vụ...`);
+      log(`[API Task] Processing ${apiUrls.length} task URLs...`);
+
       for (const url of apiUrls) {
         let taskTab = null;
-        try {
-          if (url.includes('microsoft.com/en-us/edge') || url.includes('bing.com/explore')) continue;
 
-          log(`🎯 Mở task: ${url.substring(0, 50)}...`);
+        try {
+          if (isBlockedTaskUrl(url)) continue;
+
+          log(`[Task] Opening: ${url.substring(0, 50)}...`);
           taskTab = await createTab(url, false);
           await waitForTabLoad(taskTab.id);
           await sleep(4000);
 
-          // Tự động dismiss các modal/dialog rác có thể xuất hiện trên trang đích
           await injectScript(taskTab.id, () => {
-            window.alert = () => { }; window.confirm = () => false; window.prompt = () => null;
+            window.alert = () => {};
+            window.confirm = () => false;
+            window.prompt = () => null;
+
             const cancels = document.querySelectorAll('button[class*="cancel"], button[class*="close"]');
-            cancels.forEach(c => { try { c.click(); } catch (e) { } });
+            cancels.forEach((button) => {
+              try {
+                button.click();
+              } catch (e) {}
+            });
           });
 
           await sleep(1500);
@@ -73,17 +167,15 @@ export async function runDailyTasks() {
           if (taskTab) await closeTab(taskTab.id);
         }
       }
-      log(`✅ Đã xong toàn bộ ${totalCompleted} nhiệm vụ theo API.`);
+
+      log(`[API Task] Finished ${totalCompleted} tasks from API.`);
     } else {
-      log(`⚠️ API API không báo còn nhiệm vụ nào chưa làm.`);
+      log('[API] No pending task was reported by Microsoft.');
     }
 
-    // ═══════════════════════════════════════════════════════
-    // PHASE 3: DASHBOARD / ONBOARDING MODAL
-    // Cái này vẫn sẽ cần chạy để tắt các bảng xếp hạng rác
-    // ═══════════════════════════════════════════════════════
-    log('📋 [Phase 3] Checking Dashboard tasks / extra views...');
+    log('[Phase 3] Checking dashboard buttons and extra views...');
     let dashTab = null;
+
     try {
       dashTab = await createTab('https://rewards.bing.com/', false);
       await waitForTabLoad(dashTab.id);
@@ -91,41 +183,50 @@ export async function runDailyTasks() {
 
       const clickedViews = await injectScript(dashTab.id, () => {
         return (async function () {
-          const delay = ms => new Promise(r => setTimeout(r, ms));
+          const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
           for (let i = 0; i < 3; i++) {
             window.scrollBy({ top: 300, behavior: 'smooth' });
             await delay(500);
           }
+
           window.scrollTo(0, 0);
           await delay(1000);
 
           let counts = 0;
           const viewBtns = document.querySelectorAll('[class*="hero"] button, [class*="hero"] a, carousel button, carousel a');
+
           for (const btn of viewBtns) {
             const txt = (btn.textContent || '').trim().toLowerCase();
             const rect = btn.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0 && (txt === 'view' || txt === 'xem' || txt === 'nhận')) {
-              try { btn.click(); counts++; await delay(2000); } catch (e) { }
+
+            if (rect.width > 0 && rect.height > 0 && (txt === 'view' || txt === 'xem' || txt === 'nhan')) {
+              try {
+                btn.click();
+                counts++;
+                await delay(2000);
+              } catch (e) {}
             }
           }
+
           return counts;
         })();
       });
 
       if (clickedViews > 0) {
-        log(`   ✅ Dashboard: clicked ${clickedViews} extra actions`);
+        log(`[Dashboard] Clicked ${clickedViews} extra actions.`);
       } else {
-        log(`   📦 Dashboard: No pending tasks`);
+        log('[Dashboard] No extra action was found.');
       }
+
       await sleep(1500);
       await closeTab(dashTab.id);
     } catch (e) {
       if (dashTab) await closeTab(dashTab.id);
     }
-
   } catch (error) {
     log(`[Daily Tasks Error] ${error.message}`, 'error');
   }
 
-  log(`✅ Daily tasks complete! Total API actions processed: ${totalCompleted}`, 'success');
+  log(`[Daily Tasks] Done. Total API actions processed: ${totalCompleted}`, 'success');
 }

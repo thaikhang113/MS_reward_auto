@@ -49,6 +49,7 @@ const MAX_LOGS = 50;
 const LOG_AUTO_SCROLL_THRESHOLD = 24;
 const logRenderQueue = [];
 let logFlushFrame = 0;
+let latestState = null;
 
 // ---- SIZE TOGGLE ----
 let isExpanded = false;
@@ -95,7 +96,15 @@ async function init() {
 }
 
 // ---- UI UPDATE ----
+function formatCountdown(ms) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
 function updateUI(state) {
+  latestState = state;
   const pts = state.points?.current;
   DOM.pointsValue.textContent = (pts !== null && pts !== undefined)
     ? pts.toLocaleString()
@@ -126,7 +135,12 @@ function updateUI(state) {
   };
   DOM.statusText.textContent = statusLabels[status] || status;
 
-  if (state.wave?.current > 0 && state.wave?.total > 0) {
+  if (status === 'cooldown' && state.cooldownUntil) {
+    const remainingMs = state.cooldownUntil - Date.now();
+    DOM.waveInfo.textContent = remainingMs > 0
+      ? `Wave ${state.wave.current}/${state.wave.total} · Resume in ${formatCountdown(remainingMs)}`
+      : `Wave ${state.wave.current}/${state.wave.total} · Resuming...`;
+  } else if (state.wave?.current > 0 && state.wave?.total > 0) {
     DOM.waveInfo.textContent = `Wave ${state.wave.current}/${state.wave.total}`;
   } else {
     DOM.waveInfo.textContent = '';
@@ -351,6 +365,12 @@ setInterval(async () => {
     if (response?.state) updateUI(response.state);
   } catch (e) {}
 }, 3000);
+
+setInterval(() => {
+  if (latestState?.status === 'cooldown' && latestState.cooldownUntil) {
+    updateUI(latestState);
+  }
+}, 1000);
 
 // ---- INIT ----
 init();

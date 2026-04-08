@@ -19,6 +19,7 @@ let state = {
   currentSearch: 0,
   totalSearches: 0,
   wave: { current: 0, total: 0 },
+  cooldownUntil: null,
   logs: [],
   mobileRuleEnabled: false
 };
@@ -359,6 +360,7 @@ async function startSearchAutomation() {
   state.progress = `0/${targetCount}`;
   state.percent = 0;
   state.wave = { current: 1, total: totalWaves };
+  state.cooldownUntil = null;
   broadcastState();
 
   log(`▶️ Started (${config.rewardsLevel.toUpperCase()} mode — ${targetCount} searches, ${totalWaves} waves)`);
@@ -453,11 +455,19 @@ async function startSearchAutomation() {
     if (wave < totalWaves && state.status === 'running') {
       const pauseMin = config.wavePauseMin || 15;
       const pauseMs = pauseMin * 60 * 1000 + randomInt(0, 60000);
+      const resumeAt = Date.now() + pauseMs;
       state.status = 'cooldown';
+      state.cooldownUntil = resumeAt;
+      log(`[Cooldown] Wave ${wave + 1} resumes at ${new Date(resumeAt).toLocaleTimeString()}`, 'warning');
       log(`😴 Wave pause: ${pauseMin}+ min before wave ${wave + 1}...`, 'warning');
       broadcastState();
       await sleep(pauseMs);
-      if (state.status === 'cooldown') state.status = 'running';
+      if (state.status === 'cooldown') {
+        state.status = 'running';
+        state.cooldownUntil = null;
+        log(`[Cooldown] Resuming wave ${wave + 1}/${totalWaves} now...`);
+        broadcastState();
+      }
     }
   }
 
@@ -465,6 +475,7 @@ async function startSearchAutomation() {
   if (state.status === 'running' || state.status === 'cooldown') {
     state.status = 'done';
     state.percent = 100;
+    state.cooldownUntil = null;
 
     // Final point check
     log('📊 Final point verification...');
@@ -639,84 +650,273 @@ async function checkPoints() {
   }
 }
 
+const TASK_URL_BLACKLIST = ['referandearn', 'explore', 'edge', 'install', 'app', 'purchase'];
+const REWARDS_PATH_BLACKLIST = new Set(['/', '/welcome', '/pointsbreakdown', '/starbonusdistribution']);
+
+function normalizeTaskUrl(rawUrl) {
+  if (typeof rawUrl !== 'string') return null;
+
+  const trimmedUrl = rawUrl.trim();
+  if (!trimmedUrl || trimmedUrl.startsWith('/')) return null;
+
+  try {
+    const parsedUrl = new URL(trimmedUrl);
+    const protocol = parsedUrl.protocol.toLowerCase();
+    const host = parsedUrl.hostname.toLowerCase();
+    const path = (parsedUrl.pathname.replace(/\/+$/, '') || '/').toLowerCase();
+
+    if (protocol !== 'http:' && protocol !== 'https:') return null;
+    if (TASK_URL_BLACKLIST.some((keyword) => parsedUrl.href.toLowerCase().includes(keyword))) return null;
+
+    if (host === 'rewards.bing.com') {
+      if (REWARDS_PATH_BLACKLIST.has(path) || path.startsWith('/dashboard')) {
+        return null;
+      }
+    }
+
+    parsedUrl.hash = '';
+    return parsedUrl.toString();
+  } catch (e) {
+    return null;
+  }
+}
+
+function getTaskDedupKey(url) {
+  try {
+    const parsedUrl = new URL(url);
+    const host = parsedUrl.hostname.toLowerCase();
+    const path = parsedUrl.pathname.toLowerCase();
+
+    // Microsoft often duplicates the same Bing search task with different tracking params.
+    if ((host === 'www.bing.com' || host === 'bing.com') && path === '/search') {
+      const query = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
+      if (query) return `${host}${path}?q=${query}`;
+    }
+
+    return `${host}${path}${parsedUrl.search}`;
+  } catch (e) {
+    return url;
+  }
+}
+
+function isBlockedTaskUrl(url) {
+  return !normalizeTaskUrl(url);
+}
+
+function scanUncompletedTasks(dashboard) {
+  const uniqueUrls = new Map();
+  const visited = new WeakSet();
+
+  const toNumber = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
+  const isTaskIncomplete = (task) => {
+    const maxProgress = toNumber(task.pointProgressMax);
+
+    if (maxProgress !== null) {
+      // Punch cards can stay half-done, so progress is the real completion signal.
+      const currentProgress = Math.max(0, toNumber(task.pointProgress) ?? 0);
+      return currentProgress < maxProgress;
+    }
+
+    if (typeof task.complete === 'boolean') {
+      return task.complete === false;
+    }
+
+    if (typeof task.complete === 'string') {
+      return task.complete.toLowerCase() === 'false';
+    }
+
+    // Skip wrapper nodes that expose a URL but no trustworthy completion state.
+    return false;
+  };
+
+  const visit = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(node, 'destinationUrl')) {
+      const url = normalizeTaskUrl(node.destinationUrl);
+
+      if (url && isTaskIncomplete(node)) {
+        uniqueUrls.set(getTaskDedupKey(url), url);
+      }
+
+      // Stop descending here to avoid re-processing duplicated promo branches.
+      return;
+    }
+
+    for (const value of Object.values(node)) {
+      visit(value);
+    }
+  };
+
+  visit(dashboard);
+  return [...uniqueUrls.values()];
+}
+
+async function fetchPendingTaskUrls() {
+  log('[API] Loading Microsoft Rewards dashboard...');
+
+  try {
+    const apiRes = await fetch('https://rewards.bing.com/api/getuserinfo?type=1');
+    if (!apiRes.ok) {
+      log(`[API Error] HTTP ${apiRes.status} while loading dashboard`, 'error');
+      return [];
+    }
+
+    const dbData = await apiRes.json();
+    const dashboard = dbData.dashboard || {};
+    const apiUrls = scanUncompletedTasks(dashboard);
+    log(`[API] Found ${apiUrls.length} pending tasks.`);
+    return apiUrls;
+  } catch (e) {
+    log(`[API Error] Failed to load dashboard: ${e.message}`, 'error');
+    return [];
+  }
+}
+
+async function fetchRewardsDashboard() {
+  const apiRes = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
+    cache: 'no-cache'
+  });
+
+  if (!apiRes.ok) {
+    throw new Error(`Rewards API HTTP ${apiRes.status}`);
+  }
+
+  const data = await apiRes.json();
+  return data?.dashboard || null;
+}
+
+function getPendingMobileCounterInfo(dashboard) {
+  const counters = dashboard?.userStatus?.counters;
+  if (!counters || typeof counters !== 'object') return null;
+
+  for (const [key, value] of Object.entries(counters)) {
+    if (!/mobile/i.test(key)) continue;
+    if (!value || typeof value !== 'object') continue;
+
+    const progress = Number(value.pointProgress);
+    const max = Number(value.pointProgressMax);
+    const complete = value.complete === true;
+
+    if (!Number.isFinite(max) || max <= 0) continue;
+    if (complete) continue;
+
+    const safeProgress = Number.isFinite(progress) ? progress : 0;
+    if (safeProgress < max) {
+      return {
+        key,
+        progress: safeProgress,
+        max,
+        remaining: max - safeProgress
+      };
+    }
+  }
+
+  return null;
+}
+
+async function runMobileSearchAutomation(targetCount) {
+  const config = await getConfig();
+  const safeTarget = Math.max(0, Number(targetCount) || 0);
+  let completed = 0;
+
+  for (let i = 0; i < safeTarget && state.status === 'running'; i++) {
+    const keyword = getRandomKeyword();
+    log(`[Mobile] Search ${i + 1}/${safeTarget}: ${keyword}`);
+
+    let result = await performSearch(keyword);
+    if (!result.success) {
+      for (let retry = 0; retry < config.maxRetries && !result.success; retry++) {
+        const retryKeyword = getRandomKeyword();
+        log(`[Mobile] Retry ${retry + 1}: ${retryKeyword}`, 'warning');
+        await sleep(4000);
+        result = await performSearch(retryKeyword);
+      }
+    }
+
+    if (result.success) {
+      completed++;
+    } else {
+      log(`[Mobile] Search failed: ${result.error}`, 'error');
+    }
+
+    if (state.status === 'running' && i < safeTarget - 1) {
+      await sleep(randomDelay(config.minDelay, config.maxDelay));
+    }
+  }
+
+  return completed;
+}
+
+async function startSmartAutomation() {
+  if (state.status === 'running') {
+    log('[Start] Already running.', 'warning');
+    return;
+  }
+
+  state.status = 'running';
+  state.progress = 'Tasks first';
+  state.percent = 0;
+  state.cooldownUntil = null;
+  broadcastState();
+
+  try {
+    log('[Start] Checking pending daily tasks before search...');
+    const pendingTaskUrls = await fetchPendingTaskUrls();
+
+    if (state.status !== 'running') return;
+
+    if (pendingTaskUrls.length > 0) {
+      log(`[Start] Found ${pendingTaskUrls.length} pending task URLs. Running tasks first...`);
+      await runDailyTasks(pendingTaskUrls);
+
+      const config = await getConfig();
+      if (config.mobileMode && state.status === 'running') {
+        await runMobileDailyTasks();
+      }
+
+      if (state.status === 'running') {
+        log('[Start] Daily tasks finished. Switching to search automation...');
+        await startSearchAutomation();
+      }
+      return;
+    }
+
+    log('[Start] No pending tasks found. Switching to search automation...');
+    await startSearchAutomation();
+  } catch (e) {
+    if (e.message !== 'USER_STOPPED') {
+      state.status = 'error';
+      state.cooldownUntil = null;
+      log(`[Start Error] ${e.message}`, 'error');
+      broadcastState();
+    }
+  }
+}
+
 // ---- AUTOMATION: DAILY TASKS ----
-async function runDailyTasks() {
+async function runDailyTasks(prefetchedUrls = null) {
   log(`[Daily Tasks] Bắt đầu tự động làm nhiệm vụ hàng ngày...`);
   let dashTab = null;
   let totalCompleted = 0;
-  let apiUrls = [];
+  let apiCompleted = 0;
+  let apiUrls = Array.isArray(prefetchedUrls) ? [...prefetchedUrls] : [];
 
-  try {
-    // 🔥 TẢI DỮ LIỆU SUPER ACCURATE JSON QUA API
-    log('🤖 [API] Đang tải Database JSON cực kỳ chính xác từ Microsoft Server...');
-    const apiRes = await fetch("https://rewards.bing.com/api/getuserinfo?type=1");
-    if (apiRes.ok) {
-      const dbData = await apiRes.json();
-      const dashboard = dbData.dashboard || {};
-
-      const isValidTask = (task) => {
-        if (!task || typeof task !== 'object') return false;
-        if (task.activity) return false; // skip meta wrappers
-        return task.destinationUrl && !task.destinationUrl.includes('referandearn');
-      };
-
-      const extractFromArray = (arr) => {
-        if (!Array.isArray(arr)) return;
-        for (const task of arr) {
-          if (isValidTask(task) && !task.complete && !task.pointProgressMax) {
-            apiUrls.push(task.destinationUrl);
-          }
-        }
-      };
-
-      // Extract tasks from API object structures (dailySetPromotions is {date: {default: [...]}}, etc.)
-      const extractFromSection = (obj) => {
-        if (!obj || typeof obj !== 'object') return;
-        if (Array.isArray(obj)) {
-          // some sections are direct arrays
-          extractFromArray(obj);
-          return;
-        }
-        for (const val of Object.values(obj)) {
-          if (Array.isArray(val)) {
-            extractFromArray(val);
-          } else if (typeof val === 'object' && val !== null) {
-            // drill one level deeper (e.g. { "default": [...] })
-            extractFromArray(val.default || val);
-          }
-        }
-      };
-
-      // 1. Quét Daily Set (keyed: {dateKey: {default: [tasks]}})
-      if (dashboard.dailySetPromotions) {
-        extractFromSection(dashboard.dailySetPromotions);
-      }
-      // 2. Quét More Promotions
-      if (dashboard.morePromotions) {
-        extractFromSection(dashboard.morePromotions);
-      }
-      // 3. Quét PunchCards
-      if (dashboard.punchCards && Array.isArray(dashboard.punchCards)) {
-        for (const pc of dashboard.punchCards) {
-          if (pc.activities && Array.isArray(pc.activities)) {
-            extractFromArray(pc.activities);
-          }
-          if (pc.parentPromotion) {
-            if (Array.isArray(pc.parentPromotion)) {
-              extractFromArray(pc.parentPromotion);
-            } else if (Array.isArray(pc.parentPromotion.promotions)) {
-              extractFromArray(pc.parentPromotion.promotions);
-            }
-          }
-        }
-      }
-
-      // Khử trùng lặp URL
-      apiUrls = [...new Set(apiUrls)];
-      log(`🔥 [API] Thành công! Tìm thấy chính xác ${apiUrls.length} nhiệm vụ cần làm.`);
-    }
-  } catch (e) {
-    log(`[API Error] Lỗi khi kéo Database: ${e.message}`, 'error');
+  if (apiUrls.length === 0) {
+    apiUrls = await fetchPendingTaskUrls();
   }
 
   try {
@@ -725,7 +925,7 @@ async function runDailyTasks() {
       for (const url of apiUrls) {
         let taskTab = null;
         try {
-          if (url.includes('microsoft.com/en-us/edge') || url.includes('bing.com/explore')) continue;
+          if (isBlockedTaskUrl(url)) continue;
 
           log(`🎯 Mở task: ${url.substring(0, 50)}...`);
           taskTab = await createTab(url, false);
@@ -741,12 +941,19 @@ async function runDailyTasks() {
           await sleep(1500);
           await closeTab(taskTab.id);
           totalCompleted++;
+          apiCompleted++;
           await sleep(2000);
         } catch (e) {
           if (taskTab) await closeTab(taskTab.id);
         }
       }
       log(`✅ Đã xong toàn bộ ${totalCompleted} nhiệm vụ theo API.`);
+    }
+
+    if (apiCompleted > 0) {
+      log('[Daily Tasks] API phase completed. Skipping dashboard fallback to avoid repetitive task loops.');
+      log(`✅ Daily tasks complete! Total: ${totalCompleted} actions`, 'success');
+      return { success: true, completed: totalCompleted };
     }
 
     log('📋 [Phase 3] Dashboard — clicking all task cards...');
@@ -869,7 +1076,7 @@ async function runDailyTasks() {
     return { success: true, completed: totalCompleted };
 
   } catch (e) {
-    if (tab) await closeTab(tab.id);
+    if (dashTab) await closeTab(dashTab.id);
     if (e.message === 'USER_STOPPED') throw e;
     log(`❌ Daily tasks failed: ${e.message}`, 'error');
     return { success: false, completed: totalCompleted, error: e.message };
@@ -882,17 +1089,39 @@ async function runMobileDailyTasks() {
   let totalCompleted = 0;
 
   try {
-    log('📱 Enabling mobile mode...');
+    const config = await getConfig();
+    log('[Mobile] Enabling mobile mode...');
     await setMobileMode(true);
     await sleep(500);
 
+    let plannedMobileSearches = Math.max(1, config.mobileSearchCount || 5);
+
+    try {
+      const dashboard = await fetchRewardsDashboard();
+      const mobileCounter = getPendingMobileCounterInfo(dashboard);
+
+      if (mobileCounter) {
+        plannedMobileSearches = Math.min(plannedMobileSearches, Math.max(1, mobileCounter.remaining));
+        log(`[Mobile] Counter ${mobileCounter.key}: ${mobileCounter.progress}/${mobileCounter.max}`);
+        log(`[Mobile] Running ${plannedMobileSearches} mobile searches before DOM fallback...`);
+      } else {
+        log('[Mobile] No pending mobile counter exposed by API. Using best-effort mobile searches...', 'warning');
+      }
+    } catch (e) {
+      log(`[Mobile] API pre-check failed: ${e.message}. Using best-effort mobile searches...`, 'warning');
+    }
+
+    if (plannedMobileSearches > 0 && state.status === 'running') {
+      totalCompleted += await runMobileSearchAutomation(plannedMobileSearches);
+    }
+
     // Open Bing in mobile mode
-    log('📱 Opening Bing in mobile mode...');
+    log('[Mobile] Opening Bing in mobile mode...');
     tab = await createTab('https://www.bing.com/', false);
     await waitForTabLoad(tab.id);
     await sleep(3000);
 
-    log('🔍 Looking for mobile tasks...');
+    log('[Mobile] Looking for mobile tasks...');
     const mobileResult = await injectScript(tab.id, () => {
       return (async function() {
         const results = { found: 0, clicked: 0, taskNames: [], readArticleUrls: [] };
@@ -973,7 +1202,7 @@ async function runMobileDailyTasks() {
           const rect = el.getBoundingClientRect();
           if (rect.width < 40 || rect.height < 30) continue;
           if (el.closest('header') || el.closest('nav')) continue;
-          const hasPoints = text.match(/[+]\s*\d+\s*(pts|points|điểm)?/i);
+          const hasPoints = text.match(/[+]\s*\d+|\b\d+\s*(pts|points)\b/i);
           const hasTask = text.match(/(quiz|poll|trivia|daily|check.?in|earn|reward|complete|claim)/i);
           if (hasPoints || hasTask) {
             if (text.includes('Sign') || text.includes('Settings')) continue;
@@ -991,13 +1220,13 @@ async function runMobileDailyTasks() {
     const mobileData = mobileResult || { found: 0, clicked: 0, taskNames: [], readArticleUrls: [] };
     totalCompleted += mobileData.clicked;
     if (mobileData.taskNames?.length > 0) {
-      mobileData.taskNames.forEach(name => log(`   📱 ${name}`));
+      mobileData.taskNames.forEach(name => log(`   [Mobile] ${name}`));
     }
 
     // Read articles (dwell time)
     const articleUrls = mobileData.readArticleUrls || [];
     if (articleUrls.length > 0) {
-      log(`📰 Read to Earn: Opening ${articleUrls.length} articles...`);
+      log(`[Mobile] Read to Earn: opening ${articleUrls.length} articles...`);
       for (const url of articleUrls) {
         try {
           await chrome.tabs.update(tab.id, { url });
@@ -1021,16 +1250,16 @@ async function runMobileDailyTasks() {
           });
 
           totalCompleted++;
-          log(`   📰 Read article: ${url.substring(0, 60)}...`);
+          log(`   [Mobile] Read article: ${url.substring(0, 60)}...`);
           await sleep(1000);
         } catch (e) {
-          log(`   ⚠️ Article read failed: ${e.message}`, 'warning');
+          log(`   [Mobile] Article read failed: ${e.message}`, 'warning');
         }
       }
     }
 
     // Mobile rewards dashboard
-    log('📱 Checking mobile rewards dashboard...');
+    log('[Mobile] Checking mobile rewards dashboard...');
     await chrome.tabs.update(tab.id, { url: 'https://rewards.bing.com/' });
     await waitForTabLoad(tab.id).catch(() => {});
     await sleep(4000);
@@ -1053,7 +1282,7 @@ async function runMobileDailyTasks() {
           if (rect.width < 40 || rect.height < 25) continue;
           if (el.closest('header') || el.closest('nav')) continue;
           if (text.includes('Sign in') || text.includes('Redeem') || text.includes('About')) continue;
-          const hasPoints = text.match(/[+•]\s*\d+/);
+          const hasPoints = text.match(/[+]\s*\d+|\b\d+\s*(pts|points)\b/i);
           const hasCheck = el.querySelector('[class*="check"]');
           if (hasPoints && !hasCheck) {
             results.found++;
@@ -1072,7 +1301,7 @@ async function runMobileDailyTasks() {
     const mobileDash = mobileDashResult || { found: 0, clicked: 0, taskNames: [] };
     totalCompleted += mobileDash.clicked;
     if (mobileDash.taskNames?.length > 0) {
-      mobileDash.taskNames.forEach(n => log(`   📱 Mobile dash: ${n}`));
+      mobileDash.taskNames.forEach(n => log(`   [Mobile] Dashboard task: ${n}`));
     }
 
     // Disable mobile and cleanup
@@ -1086,14 +1315,18 @@ async function runMobileDailyTasks() {
     }
     await closeTab(tab.id);
 
-    log(`✅ Mobile tasks completed: ${totalCompleted}`, 'success');
+    if (totalCompleted === 0) {
+      log('[Mobile] No actionable mobile task was found.', 'warning');
+    } else {
+      log(`[Mobile] Completed ${totalCompleted} mobile actions.`, 'success');
+    }
     return { success: true, completed: totalCompleted };
 
   } catch (e) {
     await setMobileMode(false);
     if (tab) await closeTab(tab.id);
     if (e.message === 'USER_STOPPED') throw e;
-    log(`❌ Mobile tasks failed: ${e.message}`, 'error');
+    log(`[Mobile] Failed: ${e.message}`, 'error');
     return { success: false, completed: 0, error: e.message };
   }
 }
@@ -1101,7 +1334,7 @@ async function runMobileDailyTasks() {
 // ---- AUTOMATION: RESET PAGE ----
 async function resetPage() {
   try {
-    log('🔄 Resetting & cleaning tabs...');
+    log('[Reset] Resetting and cleaning tabs...');
     const allTabs = await chrome.tabs.query({});
     let closedCount = 0;
 
@@ -1167,13 +1400,14 @@ async function handleCommand(command) {
   switch (command) {
     case 'start_search':
       if (state.status === 'running') { log('⚠️ Already running!', 'warning'); return; }
-      startSearchAutomation().catch(e => {
+      startSmartAutomation().catch(e => {
         if (e.message !== 'USER_STOPPED') log(`❌ Search Error: ${e.message}`, 'error');
       });
       break;
 
     case 'stop':
       state.status = 'stopped';
+      state.cooldownUntil = null;
       log('⏹️ Stopped!', 'warning');
       broadcastState();
       break;
@@ -1196,6 +1430,7 @@ async function handleCommand(command) {
           await runMobileDailyTasks();
         }
         if (state.status === 'running') state.status = 'idle';
+        state.cooldownUntil = null;
         broadcastState();
       })().catch(e => {
         if (e.message !== 'USER_STOPPED') log(`❌ Task Error: ${e.message}`, 'error');
@@ -1213,6 +1448,7 @@ async function handleCommand(command) {
       state.progress = '0/0';
       state.percent = 0;
       state.currentSearch = 0;
+      state.cooldownUntil = null;
       state.points = { current: null, earned: 0, baseline: null, lastCheck: null, history: [] };
       state.wave = { current: 0, total: 0 };
       log('🔄 Progress + points reset', 'success');
