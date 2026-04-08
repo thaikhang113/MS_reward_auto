@@ -131,6 +131,9 @@ body::before {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
+  transform: translateZ(0);
+  will-change: transform;
+  backface-visibility: hidden;
 }
 
 /* ---- SCROLLBAR ---- */
@@ -163,6 +166,7 @@ body::before {
   border-bottom: 1px solid var(--border-default);
   position: relative;
   z-index: 10;
+  overflow: hidden;
 }
 
 /* Neon flow line */
@@ -170,21 +174,22 @@ body::before {
   content: '';
   position: absolute;
   bottom: 0;
-  left: 0;
-  right: 0;
+  left: -100%;
+  width: 100%;
   height: 1px;
   background: linear-gradient(90deg, transparent, var(--color-primary), var(--color-secondary), transparent);
-  background-size: 200% 100%;
-  animation: headerGlow 4s linear infinite;
+  transform: translate3d(0, 0, 0);
+  will-change: transform;
+  animation: headerGlowSlide 4s linear infinite;
 }
 
-@keyframes headerGlow {
-  0% {
-    background-position: 200% 0;
+@keyframes headerGlowSlide {
+  from {
+    transform: translate3d(0, 0, 0);
   }
 
-  100% {
-    background-position: -200% 0;
+  to {
+    transform: translate3d(200%, 0, 0);
   }
 }
 
@@ -431,30 +436,36 @@ body::before {
   box-shadow: 0 0 10px rgba(0, 229, 255, 0.3);
   transition: width 0.6s var(--ease);
   position: relative;
+  overflow: hidden;
+  transform: translateZ(0);
 }
 
 .progress-bar::after {
   content: '';
   position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
-  width: 30px;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3));
-  animation: progressShine 2s infinite;
+  inset: 0;
+  width: 42%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.06) 20%,
+    rgba(255, 255, 255, 0.32) 50%,
+    rgba(255, 255, 255, 0.06) 80%,
+    transparent 100%
+  );
+  transform: translate3d(-180%, 0, 0) skewX(-18deg);
+  will-change: transform;
+  animation: progressShineSlide 2.2s linear infinite;
+  pointer-events: none;
 }
 
-@keyframes progressShine {
-  0% {
-    opacity: 0;
+@keyframes progressShineSlide {
+  from {
+    transform: translate3d(-180%, 0, 0) skewX(-18deg);
   }
 
-  50% {
-    opacity: 1;
-  }
-
-  100% {
-    opacity: 0;
+  to {
+    transform: translate3d(320%, 0, 0) skewX(-18deg);
   }
 }
 
@@ -946,13 +957,14 @@ body.expanded .config-row {
   padding: var(--space-sm) var(--space-md);
   flex: 1;
   overflow-y: auto;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 1.7;
   min-height: 120px;
   max-height: 180px;
   background: rgba(0, 0, 0, 0.2);
+  contain: content;
 }
 
 body.expanded .log-window {
