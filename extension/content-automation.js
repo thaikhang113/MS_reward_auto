@@ -25,6 +25,7 @@
       platform: 'Android'
     }
   };
+  const REWARDS_API_URL = 'https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest';
 
   function sleep(ms) {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -497,10 +498,13 @@
     try {
       const controller = new AbortController();
       const timeoutId = window.setTimeout(() => controller.abort(), 5000);
-      const response = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
+      const response = await fetch(REWARDS_API_URL, {
         signal: controller.signal,
         cache: 'no-store',
-        credentials: 'include'
+        credentials: 'include',
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest'
+        }
       });
       window.clearTimeout(timeoutId);
 
