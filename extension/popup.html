@@ -58,7 +58,7 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor"/></svg>
         <span>Stop</span>
       </button>
-      <button class="btn btn-accent" id="btn-tasks" title="Daily Tasks + Mobile Tasks">
+      <button class="btn btn-accent" id="btn-tasks" title="API-first daily tasks">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M9 11l3 3L22 4M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>Tasks</span>
       </button>
@@ -128,13 +128,55 @@
         <div class="toggle-row">
           <div class="toggle-item">
             <span class="toggle-label">
-              📱 Mobile Tasks
-              <span class="help-icon" data-tooltip="Giả lập Edge trên điện thoại để hoàn thành tasks mobile">?</span>
+              Mobile Search Mode
+              <span class="help-icon" data-tooltip="Enable verified mobile search before PC search. Counted only when the Rewards mobile counter moves.">?</span>
             </span>
             <label class="switch">
               <input type="checkbox" id="cfg-mobile">
               <span class="slider"></span>
             </label>
+          </div>
+        </div>
+        <div class="config-row">
+          <div class="form-group">
+            <label class="form-label">
+              Mobile Searches
+              <span class="help-icon" data-tooltip="Number of verified mobile search attempts to run before the PC batch.">?</span>
+            </label>
+            <input type="number" class="form-input" id="cfg-mobile-search" value="5" min="0" max="30">
+            <span class="form-note">Counted only when the Rewards mobile counter changes.</span>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Mobile Runtime</label>
+            <div class="mobile-runtime" id="mobile-runtime">
+              <div class="mobile-runtime-line" id="mobile-mode-state">Mode: Off</div>
+              <div class="mobile-runtime-line" id="mobile-progress-state">Progress: 0/0</div>
+              <div class="mobile-runtime-line" id="mobile-counted-state">Counted: 0 | Not counted: 0</div>
+              <div class="mobile-runtime-line" id="mobile-remaining-state">Counter: -- | Remaining: --</div>
+              <div class="mobile-runtime-line" id="mobile-verify-state">Verify: API Verified</div>
+            </div>
+          </div>
+        </div>
+        <div class="config-row">
+          <div class="form-group">
+            <label class="form-label">PC Runtime</label>
+            <div class="mobile-runtime" id="pc-runtime">
+              <div class="mobile-runtime-line" id="pc-mode-state">Mode: API Verified</div>
+              <div class="mobile-runtime-line" id="pc-progress-state">Progress: 0/0</div>
+              <div class="mobile-runtime-line" id="pc-counted-state">Counted: 0 | Not counted: 0</div>
+              <div class="mobile-runtime-line" id="pc-remaining-state">Counter: -- | Remaining: --</div>
+              <div class="mobile-runtime-line" id="pc-verify-state">Verify: API Verified</div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Verification Summary</label>
+            <div class="mobile-runtime" id="verification-runtime">
+              <div class="mobile-runtime-line" id="summary-baseline-state">Baseline: --</div>
+              <div class="mobile-runtime-line" id="summary-final-state">Final: --</div>
+              <div class="mobile-runtime-line" id="summary-earned-state">Earned: --</div>
+              <div class="mobile-runtime-line" id="summary-badge-state">Badge: API Verified</div>
+              <div class="mobile-runtime-line" id="summary-delta-state">Last verify: --</div>
+            </div>
           </div>
         </div>
         <button class="btn btn-save" id="btn-save-config">

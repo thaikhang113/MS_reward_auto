@@ -693,6 +693,30 @@ body.expanded .config-row {
   color: var(--text-primary);
 }
 
+.form-note {
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.mobile-runtime {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 100%;
+  padding: 10px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.mobile-runtime-line {
+  line-height: 1.4;
+}
+
 /* Speed Slider UI */
 .speed-control {
   display: flex;

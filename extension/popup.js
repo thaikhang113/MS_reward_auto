@@ -35,10 +35,26 @@ const DOM = {
   // Config
   cfgLevel: $('#cfg-level'),
   cfgSearch: $('#cfg-search'),
+  cfgMobileSearch: $('#cfg-mobile-search'),
   cfgSpeed: $('#cfg-speed'),
   speedBadge: $('#speed-badge'),
   speedDetail: $('#speed-detail'),
   cfgMobile: $('#cfg-mobile'),
+  mobileModeState: $('#mobile-mode-state'),
+  mobileProgressState: $('#mobile-progress-state'),
+  mobileCountedState: $('#mobile-counted-state'),
+  mobileRemainingState: $('#mobile-remaining-state'),
+  mobileVerifyState: $('#mobile-verify-state'),
+  pcModeState: $('#pc-mode-state'),
+  pcProgressState: $('#pc-progress-state'),
+  pcCountedState: $('#pc-counted-state'),
+  pcRemainingState: $('#pc-remaining-state'),
+  pcVerifyState: $('#pc-verify-state'),
+  summaryBaselineState: $('#summary-baseline-state'),
+  summaryFinalState: $('#summary-final-state'),
+  summaryEarnedState: $('#summary-earned-state'),
+  summaryBadgeState: $('#summary-badge-state'),
+  summaryDeltaState: $('#summary-delta-state'),
 
   // Sections
   expandedSection: $('#expanded-section'),
@@ -103,6 +119,79 @@ function formatCountdown(ms) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
+function renderMobileState(state) {
+  const mobile = state.mobile || {};
+  const planned = mobile.planned || 0;
+  const executed = mobile.executed || 0;
+  const counted = mobile.counted || 0;
+  const notCounted = mobile.notCounted || 0;
+  const counter = mobile.counter;
+  const runtimeEnabled = Boolean(mobile.enabled);
+  const configured = DOM.cfgMobile.checked;
+
+  let modeLabel = 'Off';
+  if (runtimeEnabled) {
+    modeLabel = 'Active';
+  } else if (configured) {
+    modeLabel = 'Ready';
+  }
+
+  DOM.mobileModeState.textContent = `Mode: ${modeLabel}`;
+  DOM.mobileProgressState.textContent =
+    `Progress: ${mobile.progressText || '0/0'} | Exec ${executed}/${planned}`;
+  DOM.mobileCountedState.textContent =
+    `Counted: ${counted} | Not counted: ${notCounted}`;
+  DOM.mobileRemainingState.textContent =
+    `Counter: ${counter ? `${counter.progress}/${counter.max}` : '--'} | Remaining: ${mobile.remaining ?? '--'}`;
+  DOM.mobileVerifyState.textContent =
+    `Verify: ${mobile.verificationBadge || 'API Verified'}`;
+}
+
+function renderPcState(state) {
+  const pc = state.pc || {};
+  const planned = pc.planned || 0;
+  const executed = pc.executed || 0;
+  const counted = pc.counted || 0;
+  const notCounted = pc.notCounted || 0;
+  const counter = pc.counter;
+
+  const modeLabel = pc.verificationMode === 'availablePoints'
+    ? 'points fallback'
+    : (pc.verificationMode || 'counter');
+  DOM.pcModeState.textContent = `Mode: ${modeLabel}`;
+  DOM.pcProgressState.textContent =
+    `Progress: ${pc.progressText || '0/0'} | Exec ${executed}/${planned}`;
+  DOM.pcCountedState.textContent =
+    `Counted: ${counted} | Not counted: ${notCounted}`;
+  DOM.pcRemainingState.textContent =
+    `Counter: ${counter ? `${counter.progress}/${counter.max}` : '--'} | Remaining: ${pc.remaining ?? '--'}`;
+  DOM.pcVerifyState.textContent =
+    `Verify: ${pc.verificationBadge || 'API Verified'}`;
+}
+
+function renderSummaryState(state) {
+  const summary = state.summary || {};
+  const verification = state.verification || {};
+  const lastDelta = verification.lastVerifiedDelta || {};
+  const points = state.points || {};
+  const formatValue = (value) => (
+    value !== undefined && value !== null && value !== '--'
+      ? Number(value).toLocaleString()
+      : '--'
+  );
+
+  DOM.summaryBaselineState.textContent =
+    `Baseline: ${formatValue(summary.baselinePoints ?? points.baseline ?? '--')}`;
+  DOM.summaryFinalState.textContent =
+    `Final: ${formatValue(summary.finalPoints ?? points.current ?? '--')}`;
+  DOM.summaryEarnedState.textContent =
+    `Earned: ${summary.totalEarned !== undefined && summary.totalEarned !== null ? `${summary.totalEarned >= 0 ? '+' : ''}${summary.totalEarned}` : '--'}`;
+  DOM.summaryBadgeState.textContent =
+    `Badge: ${summary.verificationBadge || 'API Verified'}`;
+  DOM.summaryDeltaState.textContent =
+    `Last verify: ${lastDelta.mode ? `${lastDelta.type || '--'} / ${lastDelta.mode} / ${lastDelta.confidence || '--'}` : '--'}`;
+}
+
 function updateUI(state) {
   latestState = state;
   const pts = state.points?.current;
@@ -154,6 +243,9 @@ function updateUI(state) {
   DOM.btnTasks.disabled = isRunning;
   DOM.btnSearch.style.opacity = isRunning ? '0.5' : '1';
   DOM.btnTasks.style.opacity = isRunning ? '0.5' : '1';
+  renderMobileState(state);
+  renderPcState(state);
+  renderSummaryState(state);
 }
 
 // ---- SPEED LEVELS ----
@@ -180,10 +272,17 @@ DOM.cfgSpeed.addEventListener('input', () => {
   updateSpeedDisplay(parseInt(DOM.cfgSpeed.value, 10));
 });
 
+DOM.cfgMobile.addEventListener('change', () => {
+  renderMobileState(latestState || { mobile: {} });
+  renderPcState(latestState || { pc: {} });
+  renderSummaryState(latestState || {});
+});
+
 // ---- CONFIG ----
 function loadConfig(config) {
   if (config.rewardsLevel) DOM.cfgLevel.value = config.rewardsLevel;
   if (config.searchCount) DOM.cfgSearch.value = config.searchCount;
+  if (config.mobileSearchCount !== undefined) DOM.cfgMobileSearch.value = config.mobileSearchCount;
 
   if (config.speedLevel) {
     DOM.cfgSpeed.value = config.speedLevel;
@@ -195,6 +294,14 @@ function loadConfig(config) {
 
   if (config.mobileMode !== undefined) {
     DOM.cfgMobile.checked = config.mobileMode;
+  }
+
+  if (latestState) {
+    updateUI(latestState);
+  } else {
+    renderMobileState({ mobile: {} });
+    renderPcState({ pc: {} });
+    renderSummaryState({});
   }
 }
 
@@ -210,7 +317,8 @@ function getConfigFromUI() {
     maxDelay: speed.maxDelay,
     waveSize: speed.waveSize,
     wavePauseMin: speed.wavePause,
-    mobileMode: DOM.cfgMobile.checked
+    mobileMode: DOM.cfgMobile.checked,
+    mobileSearchCount: parseInt(DOM.cfgMobileSearch.value, 10) || 0
   };
 }
 

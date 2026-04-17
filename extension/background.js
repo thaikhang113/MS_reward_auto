@@ -1,28 +1,41 @@
 // =============================================
-// BING REWARDS AUTO - BACKGROUND SERVICE WORKER
-// Extension-native: No server, no CDP ports
-// Uses chrome.tabs + chrome.scripting APIs
+// MICROSOFT REWARDS AUTO - MV3 BACKGROUND WORKER
+// Classic service worker architecture:
+// - importScripts() for stable helper loading
+// - single in-memory runtime state
+// - explicit keep-alive during long search delays
 // =============================================
 
-// ---- STATE ----
-let state = {
-  status: 'idle',        // idle | running | stopped | done | error | cooldown
-  progress: '0/0',
-  percent: 0,
-  points: {
-    current: null,     // null = chưa check, number = đã có data thật
-    earned: 0,         // chỉ từ verified API checks
-    baseline: null,    // điểm trước khi bắt đầu search
-    lastCheck: null,   // timestamp lần check cuối
-    history: []        // [{ time, points, wave, delta }]
-  },
-  currentSearch: 0,
-  totalSearches: 0,
-  wave: { current: 0, total: 0 },
-  cooldownUntil: null,
-  logs: [],
-  mobileRuleEnabled: false
-};
+try {
+  importScripts('keywords-data.js', 'daily_tasks_new.js');
+} catch (error) {
+  console.error('Failed to load helper scripts:', error);
+}
+
+const REWARDS_API_URL = 'https://rewards.bing.com/api/getuserinfo?type=1';
+const REWARDS_HOME_URL = 'https://rewards.bing.com/';
+const BING_HOME_URL = 'https://www.bing.com/';
+const GOOGLE_TRENDS_TRENDING_URL = 'https://trends.google.com/trending';
+const GOOGLE_TRENDS_BATCH_URL = 'https://trends.google.com/_/TrendsUi/data/batchexecute';
+
+const FETCH_TIMEOUT_MS = 15000;
+const TAB_LOAD_TIMEOUT_MS = 45000;
+const KEEP_ALIVE_INTERVAL_MS = 20000;
+const WAIT_SLICE_MS = 5000;
+const SEARCH_VERIFY_ATTEMPTS = 3;
+const SEARCH_VERIFY_DELAY_MS = 5000;
+const TASK_SETTLE_DELAY_MS = 4500;
+
+const SUCCESS_BADGE = 'API Verified';
+const FALLBACK_BADGE = 'Fallback';
+const USER_STOPPED_ERROR = 'USER_STOPPED';
+
+const MOBILE_COUNTER_RE = /mobile/i;
+const PC_COUNTER_RE = /pc|desktop/i;
+const SEARCH_COUNTER_RE = /search/i;
+const SEARCH_COUNTER_EXCLUDE_RE = /edge|bonus|streak|check.?in|offer|task|quiz|poll|punch|read|news|activity|promo/i;
+const GOOGLE_TRENDS_SID_RE = /"FdrFJe":"([^"]+)"/;
+const GOOGLE_TRENDS_BUILD_RE = /"cfb2h":"([^"]+)"/;
 
 const DEFAULT_CONFIG = {
   rewardsLevel: 'gold',
@@ -33,162 +46,1054 @@ const DEFAULT_CONFIG = {
   mobileMode: false,
   maxRetries: 2,
   waveSize: 4,
-  wavePauseMin: 15  // minutes
+  wavePauseMin: 15,
+  speedLevel: 3
 };
 
 const TIER_LIMITS = {
-  'member': { maxSearch: 3 },
-  'silver': { maxSearch: 6 },
-  'gold':   { maxSearch: 12 }
+  member: { maxSearch: 3 },
+  silver: { maxSearch: 6 },
+  gold: { maxSearch: 12 }
 };
 
-// ---- HELPERS ----
-function sleep(ms) { 
-  const checkInterval = 100;
-  const start = Date.now();
-  return new Promise((resolve, reject) => {
-    const timer = setInterval(() => {
-      if (state.status === 'stopped' || state.status === 'error') {
-        clearInterval(timer);
-        reject(new Error('USER_STOPPED'));
-      } else if (Date.now() - start >= ms) {
-        clearInterval(timer);
-        resolve(true);
-      }
-    }, checkInterval);
-  });
-}
-function randomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-function randomDelay(minS, maxS) { return randomInt(minS * 1000, maxS * 1000); }
+const GOOGLE_TRENDS_CONFIG = {
+  geo: 'VN',
+  hl: 'vi',
+  hours: 24,
+  rpcId: 'i0OFE',
+  cacheTtlMs: 30 * 60 * 1000
+};
 
-function log(text, type = 'info') {
-  const entry = { text, type, time: new Date().toLocaleTimeString() };
-  state.logs.unshift(entry);
-  if (state.logs.length > 200) state.logs.length = 200;
-  broadcast({ action: 'log', data: entry });
-}
+const TASK_HELPERS = self.DAILY_TASKS_HELPERS || {};
+const normalizeTaskUrl = TASK_HELPERS.normalizeTaskUrl || ((value) => value);
+const getTaskDedupKey = TASK_HELPERS.getTaskDedupKey || ((value) => String(value || ''));
+const scanUncompletedTasks = TASK_HELPERS.scanUncompletedTasks || (() => []);
+const isSupportedTaskUrl = TASK_HELPERS.isSupportedTaskUrl || ((url) => /bing\.com|msn\.com|microsoft\.com/i.test(String(url || '')));
 
-function broadcast(msg) {
-  chrome.runtime.sendMessage(msg).catch(() => {});
-}
-
-function broadcastState() {
-  broadcast({ action: 'state_update', data: getPublicState() });
-}
-
-function getPublicState() {
+function createSearchState(enabled = false) {
   return {
-    ...state,
-    logs: undefined,
+    enabled,
+    status: 'idle',
+    planned: 0,
+    executed: 0,
+    counted: 0,
+    notCounted: 0,
+    remaining: null,
+    counter: null,
+    progressText: '0/0',
+    verificationMode: 'counter',
+    verificationBadge: SUCCESS_BADGE,
+    lastOutcome: '',
+    lastConfidence: 'high'
+  };
+}
+
+function createTasksState() {
+  return {
+    planned: 0,
+    executed: 0,
+    completed: 0,
+    pending: 0,
+    fallbackUsed: false,
+    lastSource: 'api',
+    lastOutcome: 'Idle'
+  };
+}
+
+function createInitialState() {
+  return {
+    status: 'idle',
+    progress: 'Idle',
+    percent: 0,
+    wave: { current: 0, total: 0 },
+    cooldownUntil: null,
+    currentSearch: 0,
+    totalSearches: 0,
+    logs: [],
+    mobileRuleEnabled: false,
     points: {
-      current: state.points.current,
-      earned: state.points.earned,
-      baseline: state.points.baseline,
-      lastCheck: state.points.lastCheck,
-      historyCount: state.points.history.length
+      current: null,
+      earned: 0,
+      baseline: null,
+      final: null,
+      lastCheck: null,
+      history: []
+    },
+    pc: createSearchState(false),
+    mobile: createSearchState(false),
+    tasks: createTasksState(),
+    verification: {
+      lastDashboardCheck: null,
+      lastCounterSnapshot: null,
+      lastVerifiedDelta: null,
+      apiSource: null
+    },
+    summary: {
+      baselinePoints: null,
+      finalPoints: null,
+      totalEarned: 0,
+      verificationBadge: SUCCESS_BADGE
     }
   };
 }
 
-// ---- CONFIG ----
-async function getConfig() {
-  const result = await chrome.storage.local.get('config');
-  return { ...DEFAULT_CONFIG, ...(result.config || {}) };
+function createRuntimeMemory() {
+  return {
+    keywordPool: [],
+    keywordSource: 'pending',
+    keywordRefreshedAt: 0,
+    keywordRefreshPromise: null,
+    trendsRequestId: (Date.now() % 900000) + 100000,
+    recentKeywords: {
+      pc: [],
+      mobile: []
+    },
+    attemptedTaskKeys: new Set()
+  };
 }
 
-async function saveConfig(config) {
-  await chrome.storage.local.set({ config });
+let state = createInitialState();
+let runtimeMemory = createRuntimeMemory();
+let keepAliveTimer = null;
+let activeRunPromise = null;
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
 }
 
-// ---- KEYWORDS ----
-// Loaded from keywords-data.js via importScripts
-let KEYWORDS = [];
-try {
-  importScripts('keywords-data.js');
-  KEYWORDS = self.KEYWORD_LIST || [];
-} catch (e) {
-  console.error('Failed to load keywords:', e);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getRandomKeyword() {
-  return KEYWORDS[Math.floor(Math.random() * KEYWORDS.length)] || 'tin tức hôm nay';
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// ---- TAB HELPERS ----
-async function createTab(url, active = false) {
-  return chrome.tabs.create({ url, active });
+function randomDelay(minSeconds, maxSeconds) {
+  return randomInt(minSeconds * 1000, maxSeconds * 1000);
 }
 
-async function waitForTabLoad(tabId, timeout = 30000) {
-  return new Promise((resolve, reject) => {
-    let resolved = false;
+function toFiniteNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
 
-    function listener(tid, info) {
-      if (tid === tabId && info.status === 'complete') {
-        if (!resolved) {
-          resolved = true;
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }
+function formatSignedDelta(value) {
+  if (!Number.isFinite(value)) return 'n/a';
+  return `${value >= 0 ? '+' : ''}${value}`;
+}
+
+function formatCounter(counter) {
+  if (!counter) return 'n/a';
+  return `${counter.progress}/${counter.max}`;
+}
+
+function cloneCounter(counter) {
+  return counter
+    ? {
+        key: counter.key,
+        progress: counter.progress,
+        max: counter.max,
+        remaining: counter.remaining,
+        complete: counter.complete,
+        score: counter.score
       }
-    }
-    chrome.tabs.onUpdated.addListener(listener);
+    : null;
+}
 
-    const start = Date.now();
-    const watcher = setInterval(() => {
-      if (resolved) {
-        clearInterval(watcher);
-        return;
-      }
-      if (state.status === 'stopped' || state.status === 'error') {
-        resolved = true;
-        clearInterval(watcher);
-        chrome.tabs.onUpdated.removeListener(listener);
-        reject(new Error('USER_STOPPED'));
-      } else if (Date.now() - start >= timeout) {
-        resolved = true;
-        clearInterval(watcher);
-        chrome.tabs.onUpdated.removeListener(listener);
-        reject(new Error('Tab load timeout'));
-      }
-    }, 100);
+function isRunActive() {
+  return state.status === 'running' || state.status === 'cooldown';
+}
+
+function isRewardsRelatedUrl(url) {
+  return typeof url === 'string' && /(bing\.com|msn\.com|microsoft\.com)/i.test(url);
+}
+
+function isInjectableAutomationUrl(url) {
+  if (typeof url !== 'string' || !url) return false;
+  if (!/^https:/i.test(url)) return false;
+  return /(^https:\/\/)([^/]+\.)?(bing\.com|msn\.com|microsoft\.com)\//i.test(url);
+}
+
+function getPublicState() {
+  const snapshot = JSON.parse(JSON.stringify(state));
+  delete snapshot.logs;
+  return snapshot;
+}
+
+function broadcast(message) {
+  chrome.runtime.sendMessage(message).catch(() => {});
+}
+
+function broadcastState() {
+  broadcast({
+    action: 'state_update',
+    data: getPublicState()
   });
 }
 
-async function injectScript(tabId, func, args = []) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      func,
-      args,
-      world: 'MAIN'  // Access page's JS context
-    });
-    return results?.[0]?.result;
-  } catch (e) {
-    console.error('Inject error:', e);
-    return null;
+function log(text, type = 'info') {
+  const entry = {
+    text,
+    type,
+    time: new Date().toLocaleTimeString()
+  };
+
+  state.logs.unshift(entry);
+  if (state.logs.length > 200) {
+    state.logs.length = 200;
+  }
+
+  broadcast({ action: 'log', data: entry });
+}
+
+function recordPointSnapshot(points, label) {
+  if (!Number.isFinite(points)) return;
+
+  state.points.history.push({
+    time: new Date().toLocaleTimeString(),
+    label,
+    points
+  });
+
+  if (state.points.history.length > 50) {
+    state.points.history = state.points.history.slice(-50);
   }
 }
 
-async function injectFile(tabId, file) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      files: [file],
-      world: 'MAIN'
-    });
-    return results?.[0]?.result;
-  } catch (e) {
-    console.error('Inject file error:', e);
-    return null;
+function applyCurrentPoints(points, label = null) {
+  if (!Number.isFinite(points)) return;
+
+  state.points.current = points;
+  state.points.final = points;
+  state.points.lastCheck = Date.now();
+  state.summary.finalPoints = points;
+
+  if (Number.isFinite(state.points.baseline)) {
+    state.points.earned = points - state.points.baseline;
+    state.summary.totalEarned = state.points.earned;
   }
+
+  if (label) {
+    recordPointSnapshot(points, label);
+  }
+}
+
+function applyBaselinePoints(points) {
+  if (!Number.isFinite(points)) return;
+
+  state.points.baseline = points;
+  state.points.earned = 0;
+  state.summary.baselinePoints = points;
+  state.summary.finalPoints = points;
+  state.summary.totalEarned = 0;
+  state.points.history = [];
+  applyCurrentPoints(points, 'baseline');
+}
+
+function getFallbackKeywordPool() {
+  const source = typeof self.getAllKeywords === 'function'
+    ? self.getAllKeywords()
+    : (Array.isArray(self.KEYWORD_LIST) ? self.KEYWORD_LIST : []);
+
+  return Array.isArray(source) && source.length
+    ? [...source]
+    : ['bing rewards', 'microsoft rewards', 'bing search'];
+}
+
+function normalizeKeyword(value) {
+  if (typeof value !== 'string') return '';
+
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length < 3 || normalized.length > 120) return '';
+  if (!/[\p{L}\p{N}]/u.test(normalized)) return '';
+
+  return normalized;
+}
+
+function getNextTrendsRequestId() {
+  runtimeMemory.trendsRequestId += 100000;
+  if (runtimeMemory.trendsRequestId > 999999) {
+    runtimeMemory.trendsRequestId = 100000 + (runtimeMemory.trendsRequestId % 900000);
+  }
+  return runtimeMemory.trendsRequestId;
+}
+
+function parseGoogleTrendsBootstrap(html) {
+  const sid = GOOGLE_TRENDS_SID_RE.exec(String(html || ''))?.[1] || '';
+  const buildLabel = GOOGLE_TRENDS_BUILD_RE.exec(String(html || ''))?.[1] || '';
+
+  if (!sid || !buildLabel) {
+    throw new Error('Could not parse Google Trends bootstrap metadata');
+  }
+
+  return { sid, buildLabel };
+}
+
+function parseBatchedExecuteRpcPayload(text, rpcId) {
+  const lines = String(text || '').split('\n');
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('[')) continue;
+
+    try {
+      const chunk = JSON.parse(trimmed);
+      if (!Array.isArray(chunk)) continue;
+
+      for (const item of chunk) {
+        if (!Array.isArray(item) || item[0] !== 'wrb.fr' || item[1] !== rpcId) {
+          continue;
+        }
+
+        return typeof item[2] === 'string'
+          ? JSON.parse(item[2])
+          : item[2];
+      }
+    } catch (error) {}
+  }
+
+  throw new Error(`RPC payload ${rpcId} not found in batchexecute response`);
+}
+
+function extractGoogleTrendsKeywords(payload) {
+  const topics = Array.isArray(payload?.[1]) ? payload[1] : [];
+  const seen = new Set();
+  const keywords = [];
+
+  const addKeyword = (value) => {
+    const normalized = normalizeKeyword(value);
+    if (!normalized) return;
+
+    const dedupKey = normalized.toLowerCase();
+    if (seen.has(dedupKey)) return;
+
+    seen.add(dedupKey);
+    keywords.push(normalized);
+  };
+
+  for (const topic of topics) {
+    if (!Array.isArray(topic)) continue;
+
+    addKeyword(topic[0]);
+  }
+
+  return keywords;
+}
+
+async function fetchTextWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs || FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      cache: 'no-store',
+      credentials: options.credentials || 'omit',
+      mode: options.mode || 'cors',
+      method: options.method || 'GET',
+      headers: options.headers,
+      body: options.body,
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return response.text();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchGoogleTrendsKeywords(options = {}) {
+  const geo = options.geo || GOOGLE_TRENDS_CONFIG.geo;
+  const hl = options.hl || GOOGLE_TRENDS_CONFIG.hl;
+  const hours = clamp(parseInt(options.hours, 10) || GOOGLE_TRENDS_CONFIG.hours, 4, 48);
+
+  await touchKeepAlive();
+
+  const pageUrl = new URL(GOOGLE_TRENDS_TRENDING_URL);
+  pageUrl.searchParams.set('geo', geo);
+  pageUrl.searchParams.set('hl', hl);
+
+  const html = await fetchTextWithTimeout(pageUrl.toString());
+  const bootstrap = parseGoogleTrendsBootstrap(html);
+
+  const requestUrl = new URL(GOOGLE_TRENDS_BATCH_URL);
+  requestUrl.searchParams.set('rpcids', GOOGLE_TRENDS_CONFIG.rpcId);
+  requestUrl.searchParams.set('source-path', '/trending');
+  requestUrl.searchParams.set('f.sid', bootstrap.sid);
+  requestUrl.searchParams.set('bl', bootstrap.buildLabel);
+  requestUrl.searchParams.set('hl', hl);
+  requestUrl.searchParams.set('_reqid', String(getNextTrendsRequestId()));
+  requestUrl.searchParams.set('rt', 'c');
+
+  const rpcPayload = JSON.stringify([null, null, geo, 0, hl, hours, 1]);
+  const fReq = JSON.stringify([[[GOOGLE_TRENDS_CONFIG.rpcId, rpcPayload, null, 'generic']]]);
+  const responseText = await fetchTextWithTimeout(requestUrl.toString(), {
+    method: 'POST',
+    body: `f.req=${encodeURIComponent(fReq)}&`,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      'X-Same-Domain': '1'
+    }
+  });
+
+  const payload = parseBatchedExecuteRpcPayload(responseText, GOOGLE_TRENDS_CONFIG.rpcId);
+  const keywords = extractGoogleTrendsKeywords(payload);
+
+  if (!keywords.length) {
+    throw new Error('Google Trends returned an empty keyword set');
+  }
+
+  return {
+    keywords,
+    meta: {
+      geo,
+      hl,
+      hours,
+      totalTopics: Array.isArray(payload?.[1]) ? payload[1].length : 0
+    }
+  };
+}
+
+async function refreshKeywordPool(force = false) {
+  const isFresh = !force
+    && runtimeMemory.keywordPool.length
+    && Date.now() - runtimeMemory.keywordRefreshedAt < GOOGLE_TRENDS_CONFIG.cacheTtlMs;
+
+  if (isFresh) {
+    return runtimeMemory.keywordPool;
+  }
+
+  if (runtimeMemory.keywordRefreshPromise) {
+    return runtimeMemory.keywordRefreshPromise;
+  }
+
+  runtimeMemory.keywordRefreshPromise = (async () => {
+    try {
+      const result = await fetchGoogleTrendsKeywords();
+      runtimeMemory.keywordPool = result.keywords;
+      runtimeMemory.keywordSource = 'google_trends';
+      runtimeMemory.keywordRefreshedAt = Date.now();
+      log(`[Keywords] Loaded ${result.keywords.length} live Google Trends keywords (${result.meta.geo}, ${result.meta.hours}h).`, 'success');
+      return runtimeMemory.keywordPool;
+    } catch (error) {
+      const fallbackKeywords = getFallbackKeywordPool();
+      runtimeMemory.keywordPool = fallbackKeywords;
+      runtimeMemory.keywordSource = 'fallback';
+      runtimeMemory.keywordRefreshedAt = Date.now();
+      log(`[Keywords] Google Trends failed (${error.message}). Using local fallback keywords.`, 'warning');
+      return runtimeMemory.keywordPool;
+    } finally {
+      runtimeMemory.keywordRefreshPromise = null;
+    }
+  })();
+
+  return runtimeMemory.keywordRefreshPromise;
+}
+
+async function ensureKeywordPoolReady(force = false) {
+  if (!runtimeMemory.keywordPool.length || force) {
+    await refreshKeywordPool(force);
+  }
+
+  return runtimeMemory.keywordPool;
+}
+
+function resetSearchBranch(key) {
+  state[key] = createSearchState(key === 'mobile' ? state.mobileRuleEnabled : false);
+}
+
+function resetRuntimeState() {
+  state.progress = 'Idle';
+  state.percent = 0;
+  state.wave = { current: 0, total: 0 };
+  state.cooldownUntil = null;
+  state.currentSearch = 0;
+  state.totalSearches = 0;
+  state.points = {
+    current: null,
+    earned: 0,
+    baseline: null,
+    final: null,
+    lastCheck: null,
+    history: []
+  };
+  resetSearchBranch('pc');
+  resetSearchBranch('mobile');
+  state.tasks = createTasksState();
+  state.verification = {
+    lastDashboardCheck: null,
+    lastCounterSnapshot: null,
+    lastVerifiedDelta: null,
+    apiSource: null
+  };
+  state.summary = {
+    baselinePoints: null,
+    finalPoints: null,
+    totalEarned: 0,
+    verificationBadge: SUCCESS_BADGE
+  };
+
+  runtimeMemory = createRuntimeMemory();
+}
+
+function syncSearchProgress(key, useAsPrimary = false) {
+  const branch = state[key];
+  branch.progressText = `${branch.counted}/${branch.planned}`;
+  branch.notCounted = Math.max(0, branch.executed - branch.counted);
+  branch.enabled = key === 'mobile' ? state.mobileRuleEnabled : true;
+
+  if (useAsPrimary) {
+    const label = key === 'mobile' ? 'Mobile' : 'PC';
+    state.progress = `${label} ${branch.progressText}`;
+    state.percent = branch.planned > 0
+      ? Math.min(100, Math.floor((branch.counted / branch.planned) * 100))
+      : 0;
+  }
+
+  broadcastState();
+}
+
+function syncTaskProgress(useAsPrimary = false) {
+  if (useAsPrimary) {
+    state.progress = `Tasks ${state.tasks.completed}/${state.tasks.planned}`;
+    state.percent = state.tasks.planned > 0
+      ? Math.min(100, Math.floor((state.tasks.completed / state.tasks.planned) * 100))
+      : 0;
+  }
+
+  broadcastState();
+}
+
+function setBranchCounterState(key, counter) {
+  state[key].counter = counter
+    ? {
+        key: counter.key,
+        progress: counter.progress,
+        max: counter.max
+      }
+    : null;
+  state[key].remaining = counter?.remaining ?? null;
+}
+
+function updateSummaryBadge() {
+  const badges = [state.pc.verificationBadge];
+  if (state.mobile.planned > 0 || state.mobile.counted > 0 || state.mobile.executed > 0 || state.mobile.enabled) {
+    badges.push(state.mobile.verificationBadge);
+  }
+
+  state.summary.verificationBadge = badges.every((badge) => badge === SUCCESS_BADGE)
+    ? SUCCESS_BADGE
+    : FALLBACK_BADGE;
+}
+
+function sanitizeConfig(input = {}) {
+  const merged = { ...DEFAULT_CONFIG, ...(input || {}) };
+
+  merged.rewardsLevel = ['member', 'silver', 'gold'].includes(merged.rewardsLevel)
+    ? merged.rewardsLevel
+    : DEFAULT_CONFIG.rewardsLevel;
+  merged.searchCount = clamp(parseInt(merged.searchCount, 10) || DEFAULT_CONFIG.searchCount, 0, 30);
+  merged.mobileSearchCount = clamp(parseInt(merged.mobileSearchCount, 10) || 0, 0, 30);
+  merged.minDelay = clamp(parseInt(merged.minDelay, 10) || DEFAULT_CONFIG.minDelay, 1, 180);
+  merged.maxDelay = clamp(parseInt(merged.maxDelay, 10) || DEFAULT_CONFIG.maxDelay, merged.minDelay, 240);
+  merged.mobileMode = Boolean(merged.mobileMode);
+  merged.maxRetries = clamp(parseInt(merged.maxRetries, 10) || DEFAULT_CONFIG.maxRetries, 0, 5);
+  merged.waveSize = clamp(parseInt(merged.waveSize, 10) || DEFAULT_CONFIG.waveSize, 0, 20);
+  merged.wavePauseMin = clamp(parseInt(merged.wavePauseMin, 10) || DEFAULT_CONFIG.wavePauseMin, 0, 120);
+  merged.speedLevel = clamp(parseInt(merged.speedLevel, 10) || DEFAULT_CONFIG.speedLevel, 1, 6);
+
+  return merged;
+}
+
+async function getConfig() {
+  const result = await chrome.storage.local.get('config');
+  return sanitizeConfig(result.config || {});
+}
+
+async function saveConfig(config) {
+  const sanitized = sanitizeConfig(config);
+  await chrome.storage.local.set({ config: sanitized });
+  return sanitized;
+}
+
+async function touchKeepAlive() {
+  if (!isRunActive()) return;
+
+  try {
+    await chrome.runtime.getPlatformInfo();
+  } catch (error) {}
+}
+
+function startKeepAlive() {
+  if (keepAliveTimer) return;
+
+  keepAliveTimer = setInterval(() => {
+    touchKeepAlive().catch(() => {});
+  }, KEEP_ALIVE_INTERVAL_MS);
+}
+
+function stopKeepAlive() {
+  if (!keepAliveTimer) return;
+
+  clearInterval(keepAliveTimer);
+  keepAliveTimer = null;
+}
+
+async function waitWithStop(ms) {
+  const endTime = Date.now() + Math.max(0, ms);
+
+  while (Date.now() < endTime) {
+    if (state.status === 'stopped') {
+      throw new Error(USER_STOPPED_ERROR);
+    }
+
+    const remaining = endTime - Date.now();
+    const slice = Math.min(WAIT_SLICE_MS, remaining);
+    await sleep(slice);
+    await touchKeepAlive();
+  }
+}
+
+function getSearchDelayRange(config, mobile = false) {
+  if (!mobile) {
+    return {
+      min: Math.max(1, Number(config.minDelay) || DEFAULT_CONFIG.minDelay),
+      max: Math.max(1, Number(config.maxDelay) || DEFAULT_CONFIG.maxDelay)
+    };
+  }
+
+  const minDelay = Math.max((Number(config.minDelay) || DEFAULT_CONFIG.minDelay) + 8, 18);
+  const maxDelay = Math.max((Number(config.maxDelay) || DEFAULT_CONFIG.maxDelay) + 15, minDelay + 6);
+  return { min: minDelay, max: maxDelay };
+}
+
+function getDiversifiedKeyword(type) {
+  if (!runtimeMemory.keywordPool.length) {
+    runtimeMemory.keywordPool = getFallbackKeywordPool();
+  }
+
+  const recentList = type === 'mobile'
+    ? runtimeMemory.recentKeywords.mobile
+    : runtimeMemory.recentKeywords.pc;
+
+  const recentSet = new Set(recentList.slice(-10));
+  const candidates = runtimeMemory.keywordPool.filter((keyword) => !recentSet.has(keyword));
+  const pool = candidates.length ? candidates : runtimeMemory.keywordPool;
+  const keyword = pool[Math.floor(Math.random() * pool.length)] || 'bing rewards news';
+
+  recentList.push(keyword);
+  if (recentList.length > 20) {
+    recentList.splice(0, recentList.length - 20);
+  }
+
+  return keyword;
+}
+
+async function createTab(url, active = false) {
+  await touchKeepAlive();
+  return chrome.tabs.create({ url, active });
 }
 
 async function closeTab(tabId) {
-  try { await chrome.tabs.remove(tabId); } catch (e) {}
+  if (!Number.isInteger(tabId)) return;
+
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch (error) {}
 }
 
-// ---- MOBILE MODE ----
+async function getTab(tabId) {
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function waitForTabLoad(tabId, timeout = TAB_LOAD_TIMEOUT_MS) {
+  const existingTab = await getTab(tabId);
+  if (!existingTab) {
+    throw new Error(`Tab ${tabId} no longer exists`);
+  }
+
+  if (existingTab.status === 'complete') {
+    return existingTab;
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error(`Tab ${tabId} load timeout`));
+    }, timeout);
+
+    const listener = async (updatedTabId, changeInfo) => {
+      if (settled || updatedTabId !== tabId || changeInfo.status !== 'complete') {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timeoutId);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(await getTab(tabId));
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function navigateTab(tabId, url) {
+  await chrome.tabs.update(tabId, { url });
+  await waitForTabLoad(tabId);
+  return getTab(tabId);
+}
+
+async function getOpenTabIdSet() {
+  const tabs = await chrome.tabs.query({});
+  return new Set(tabs.map((tab) => tab.id));
+}
+
+async function closeNewRewardsTabs(beforeTabIds, keepTabIds = []) {
+  const keepSet = new Set(keepTabIds);
+  const tabs = await chrome.tabs.query({});
+
+  for (const tab of tabs) {
+    if (keepSet.has(tab.id)) continue;
+    if (beforeTabIds.has(tab.id)) continue;
+    if (!isRewardsRelatedUrl(tab.url)) continue;
+    await closeTab(tab.id);
+  }
+}
+
+function isTransientInjectionError(error) {
+  const message = String(error?.message || error || '');
+  return /Execution context was destroyed|Frame with ID 0 is showing error page|The frame was removed|Cannot access contents of the page|No tab with id/i.test(message);
+}
+
+function isNavigationDestroyedContextError(error) {
+  const message = String(error?.message || error || '');
+  return /Execution context was destroyed|The frame was removed/i.test(message);
+}
+
+async function ensureAutomationInjected(tabId) {
+  const tab = await getTab(tabId);
+  if (!tab) {
+    throw new Error(`Tab ${tabId} no longer exists`);
+  }
+
+  if (!isInjectableAutomationUrl(tab.url)) {
+    throw new Error(`Tab URL is not injectable: ${tab.url || 'unknown'}`);
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content-automation.js'],
+    world: 'MAIN'
+  });
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: 'MAIN',
+    func: () => ({
+      ready: Boolean(window.__BRA__),
+      version: window.__BRA__?.version || null
+    })
+  });
+
+  const status = results?.[0]?.result;
+  if (!status?.ready) {
+    throw new Error('Automation API is unavailable after injection');
+  }
+
+  return status;
+}
+
+async function callAutomationMethod(tabId, methodName, args = [], options = {}) {
+  const retries = Math.max(1, options.retries || 1);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      const tab = await getTab(tabId);
+      if (!tab) {
+        throw new Error(`Tab ${tabId} no longer exists`);
+      }
+
+      if (tab.status !== 'complete') {
+        await waitForTabLoad(tabId);
+      }
+
+      await ensureAutomationInjected(tabId);
+      await touchKeepAlive();
+
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: 'MAIN',
+        func: async (invokedMethodName, invokedArgs) => {
+          const api = window.__BRA__;
+          if (!api || typeof api[invokedMethodName] !== 'function') {
+            throw new Error(`Automation method not available: ${invokedMethodName}`);
+          }
+
+          return api[invokedMethodName](...(invokedArgs || []));
+        },
+        args: [methodName, args]
+      });
+
+      return results?.[0]?.result ?? null;
+    } catch (error) {
+      lastError = error;
+
+      if (options.allowDestroyedContext && isNavigationDestroyedContextError(error)) {
+        await waitForTabLoad(tabId).catch(() => null);
+        return {
+          success: true,
+          navigationLikely: true,
+          transientError: String(error?.message || error)
+        };
+      }
+
+      if (attempt < retries && isTransientInjectionError(error)) {
+        await waitWithStop(600);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw lastError || new Error(`Automation method failed: ${methodName}`);
+}
+
+async function fetchJsonWithTimeout(url) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      cache: 'no-store',
+      credentials: 'include',
+      mode: 'cors',
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return response.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchRewardsDashboardViaTab() {
+  let tab = null;
+
+  try {
+    tab = await createTab(REWARDS_HOME_URL, false);
+    await waitForTabLoad(tab.id);
+    await waitWithStop(2000);
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      func: async (apiUrl) => {
+        const response = await fetch(apiUrl, {
+          cache: 'no-store',
+          credentials: 'include'
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        return response.json();
+      },
+      args: [REWARDS_API_URL]
+    });
+
+    const payload = results?.[0]?.result;
+    if (!payload?.dashboard) {
+      throw new Error('Dashboard payload is missing');
+    }
+
+    return payload;
+  } finally {
+    if (tab?.id) {
+      await closeTab(tab.id);
+    }
+  }
+}
+
+function normalizeCounter(key, value) {
+  if (!value || typeof value !== 'object') return null;
+
+  const progress = toFiniteNumber(value.pointProgress);
+  const max = toFiniteNumber(value.pointProgressMax);
+  if (!Number.isFinite(max) || max <= 0) return null;
+
+  const safeProgress = Number.isFinite(progress) ? progress : 0;
+  return {
+    key,
+    progress: safeProgress,
+    max,
+    remaining: Math.max(0, max - safeProgress),
+    complete: value.complete === true || safeProgress >= max
+  };
+}
+
+function getCountersSnapshot(dashboard) {
+  const counters = dashboard?.userStatus?.counters;
+  if (!counters || typeof counters !== 'object') return {};
+
+  const snapshot = {};
+  for (const [key, value] of Object.entries(counters)) {
+    const normalized = normalizeCounter(key, value);
+    if (normalized) {
+      snapshot[key] = normalized;
+    }
+  }
+
+  return snapshot;
+}
+
+function scoreCounter(counter, type) {
+  const key = counter.key.toLowerCase();
+  let score = 0;
+
+  if (SEARCH_COUNTER_RE.test(key)) score += 4;
+  if (type === 'mobile') {
+    if (MOBILE_COUNTER_RE.test(key)) score += 10;
+    if (PC_COUNTER_RE.test(key)) score -= 8;
+  } else {
+    if (PC_COUNTER_RE.test(key)) score += 10;
+    if (MOBILE_COUNTER_RE.test(key)) score -= 10;
+  }
+
+  if (SEARCH_COUNTER_EXCLUDE_RE.test(key)) score -= 5;
+  if (counter.remaining > 0) score += 2;
+  if (counter.max >= 5) score += 1;
+  return score;
+}
+
+function pickBestCounter(countersSnapshot, type, preferredKey = null) {
+  if (preferredKey && countersSnapshot?.[preferredKey]) {
+    return { ...countersSnapshot[preferredKey], score: 999 };
+  }
+
+  const counters = Object.values(countersSnapshot || {});
+  if (!counters.length) return null;
+
+  const scored = counters
+    .map((counter) => ({ ...counter, score: scoreCounter(counter, type) }))
+    .filter((counter) => counter.score > 0)
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      if (right.max !== left.max) return right.max - left.max;
+      if (left.progress !== right.progress) return left.progress - right.progress;
+      return left.key.localeCompare(right.key);
+    });
+
+  if (!scored.length) return null;
+  return scored[0];
+}
+
+function getAvailablePoints(dashboard) {
+  return toFiniteNumber(dashboard?.userStatus?.availablePoints);
+}
+
+function createDashboardSnapshot(dashboard, source) {
+  const counters = getCountersSnapshot(dashboard);
+  const pcCounter = pickBestCounter(counters, 'pc');
+  const mobileCounter = pickBestCounter(counters, 'mobile');
+  const pendingTasks = scanUncompletedTasks(dashboard);
+
+  return {
+    dashboard,
+    source,
+    checkedAt: Date.now(),
+    availablePoints: getAvailablePoints(dashboard),
+    counters,
+    pcCounter,
+    mobileCounter,
+    pendingTasks
+  };
+}
+
+function getSnapshotCounter(snapshot, type, preferredKey = null) {
+  if (!snapshot) return null;
+
+  if (type === 'mobile') {
+    return preferredKey
+      ? pickBestCounter(snapshot.counters, 'mobile', preferredKey)
+      : (snapshot.mobileCounter || pickBestCounter(snapshot.counters, 'mobile'));
+  }
+
+  return preferredKey
+    ? pickBestCounter(snapshot.counters, 'pc', preferredKey)
+    : (snapshot.pcCounter || pickBestCounter(snapshot.counters, 'pc'));
+}
+
+async function fetchRewardsDashboard(options = {}) {
+  const {
+    context = 'dashboard',
+    logCounters = false,
+    recordLabel = null,
+    silent = false
+  } = options;
+
+  let payload = null;
+  let source = 'background_fetch';
+
+  try {
+    payload = await fetchJsonWithTimeout(REWARDS_API_URL);
+  } catch (error) {
+    source = 'tab_fallback';
+    payload = await fetchRewardsDashboardViaTab();
+  }
+
+  const dashboard = payload?.dashboard || payload;
+  if (!dashboard || typeof dashboard !== 'object') {
+    throw new Error('Invalid rewards dashboard payload');
+  }
+
+  const snapshot = createDashboardSnapshot(dashboard, source);
+  state.verification.lastDashboardCheck = snapshot.checkedAt;
+  state.verification.lastCounterSnapshot = snapshot.counters;
+  state.verification.apiSource = source;
+
+  if (Number.isFinite(snapshot.availablePoints)) {
+    applyCurrentPoints(snapshot.availablePoints, recordLabel);
+  }
+
+  if (!silent) {
+    log(`[API] Dashboard loaded via ${source} (${context})`, 'success');
+    if (Number.isFinite(snapshot.availablePoints)) {
+      log(`[API] Available points: ${snapshot.availablePoints}`);
+    }
+    if (logCounters && snapshot.pcCounter) {
+      log(`[API] PC counter: ${snapshot.pcCounter.key} ${formatCounter(snapshot.pcCounter)}`);
+    }
+    if (logCounters && snapshot.mobileCounter) {
+      log(`[API] Mobile counter: ${snapshot.mobileCounter.key} ${formatCounter(snapshot.mobileCounter)}`);
+    }
+    if (logCounters) {
+      log(`[API] Pending tasks: ${snapshot.pendingTasks.length}`);
+    }
+  }
+
+  broadcastState();
+  return snapshot;
+}
+
 async function setMobileMode(enabled) {
   try {
     if (enabled) {
@@ -200,1270 +1105,941 @@ async function setMobileMode(enabled) {
         disableRulesetIds: ['mobile_ua_rules']
       });
     }
+
     state.mobileRuleEnabled = enabled;
-  } catch (e) {
-    console.error('Mobile mode toggle error:', e);
-  }
-}
-
-// ---- AUTOMATION: SEARCH ----
-async function performSearch(keyword) {
-  let tab = null;
-  try {
-    // 1. Create tab → bing.com
-    tab = await createTab('https://www.bing.com', false);
-    await waitForTabLoad(tab.id);
-    await sleep(2000);
-
-    // 2. Inject automation script
-    await injectFile(tab.id, 'content-automation.js');
-    await sleep(500);
-
-    // 3. Type and search
-    const searchResult = await injectScript(tab.id, (kw) => {
-      return window.__BRA__?.typeAndSearch(kw);
-    }, [keyword]);
-
-    if (!searchResult?.success) {
-      await closeTab(tab.id);
-      return { success: false, error: 'search_failed' };
-    }
-
-    // 4. Wait for results page
-    await waitForTabLoad(tab.id).catch(() => {});
-    await sleep(2000);
-
-    // 5. Do search interaction (anti-ban)
-    await injectFile(tab.id, 'content-automation.js');
-    await sleep(300);
-    await injectScript(tab.id, () => {
-      return window.__BRA__?.enhancedSearchInteraction();
-    });
-
-    await closeTab(tab.id);
-    return { success: true, keyword };
-
-  } catch (e) {
-    if (tab) await closeTab(tab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    return { success: false, error: e.message };
-  }
-}
-
-// ---- SILENT POINT CHECK (no tab open, just fetch) ----
-async function fetchPointsQuiet() {
-  let tab = null;
-  try {
-    tab = await createTab('https://rewards.bing.com/', false);
-    await waitForTabLoad(tab.id).catch(() => {});
-    await sleep(4000);
-
-    const result = await injectScript(tab.id, () => {
-      return (async function() {
-        // METHOD 1: API (nhanh, chính xác)
-        try {
-          const controller = new AbortController();
-          const tid = setTimeout(() => controller.abort(), 8000);
-          const r = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
-            signal: controller.signal, cache: 'no-cache'
-          });
-          clearTimeout(tid);
-          if (r.ok) {
-            const data = await r.json();
-            const pts = data?.dashboard?.userStatus?.availablePoints;
-            if (typeof pts === 'number') return { points: pts, source: 'api' };
-          }
-        } catch (e) {}
-
-        // METHOD 2: DOM selectors (fallback)
-        const extractNum = (text) => {
-          if (!text) return null;
-          const m = text.match(/(\d{1,3}(?:[,.\s]\d{3})+|\d+)/g);
-          if (m) {
-            const nums = m.map(x => parseInt(x.replace(/[,.\s]/g, ''), 10))
-              .filter(n => !isNaN(n) && n >= 0 && n < 1000000)
-              .sort((a, b) => b - a);
-            for (const n of nums) { if (n >= 100) return n; }
-          }
-          return null;
-        };
-        const sels = [
-          '.text-title1.font-semibold', 'p.text-title1.font-semibold',
-          '.flex.items-center.gap-2 > p', '[class*="text-title1"]',
-          'mee-rewards-user-status-balance', '#balanceToolTip',
-          '.pointsValue', '[class*="balance"]'
-        ];
-        for (const sel of sels) {
-          try {
-            const el = document.querySelector(sel);
-            if (el) {
-              const n = extractNum(el.innerText || el.textContent);
-              if (n !== null) return { points: n, source: 'dom' };
-            }
-          } catch(e) {}
-        }
-        return { points: null, source: 'none' };
-      })();
-    });
-
-    await closeTab(tab.id);
-    return result || { points: null, source: 'error' };
-
-  } catch (e) {
-    if (tab) await closeTab(tab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    return { points: null, source: 'error', error: e.message };
-  }
-}
-
-// Record a point snapshot into history
-function recordPointSnapshot(points, wave, label) {
-  if (points === null) return;
-  const prevPoints = state.points.history.length > 0
-    ? state.points.history[state.points.history.length - 1].points
-    : state.points.baseline;
-  const delta = (prevPoints !== null && points !== null) ? points - prevPoints : null;
-
-  state.points.history.push({
-    time: new Date().toLocaleTimeString(),
-    points,
-    wave,
-    delta,
-    label
-  });
-
-  // Keep max 50 entries
-  if (state.points.history.length > 50) {
-    state.points.history = state.points.history.slice(-50);
-  }
-
-  state.points.current = points;
-  state.points.lastCheck = Date.now();
-
-  // Recalculate real earned from baseline
-  if (state.points.baseline !== null) {
-    state.points.earned = points - state.points.baseline;
-  }
-}
-
-// ---- AUTOMATION: SEARCH ALL (Wave System) ----
-async function startSearchAutomation() {
-  const config = await getConfig();
-  const tierLimit = TIER_LIMITS[config.rewardsLevel]?.maxSearch || 12;
-  const targetCount = Math.min(config.searchCount, tierLimit);
-  const waveSize = config.waveSize || 4;
-  const totalWaves = Math.ceil(targetCount / waveSize);
-
-  state.status = 'running';
-  state.currentSearch = 0;
-  state.totalSearches = targetCount;
-  state.progress = `0/${targetCount}`;
-  state.percent = 0;
-  state.wave = { current: 1, total: totalWaves };
-  state.cooldownUntil = null;
-  broadcastState();
-
-  log(`▶️ Started (${config.rewardsLevel.toUpperCase()} mode — ${targetCount} searches, ${totalWaves} waves)`);
-
-  // ====== BASELINE: Check points BEFORE starting ======
-  log('📊 Checking points before starting (baseline)...');
-  const baseline = await fetchPointsQuiet();
-  if (baseline.points !== null) {
-    state.points.baseline = baseline.points;
-    state.points.current = baseline.points;
-    state.points.earned = 0;
-    state.points.history = [];
-    recordPointSnapshot(baseline.points, 0, 'baseline');
-    log(`📊 Baseline: ${baseline.points.toLocaleString()} pts (${baseline.source})`, 'success');
-  } else {
-    log('⚠️ Could not read baseline points — earned tracking disabled', 'warning');
-    state.points.baseline = null;
-    state.points.earned = 0;
-  }
-  broadcastState();
-
-  let completed = 0;
-
-  for (let wave = 1; wave <= totalWaves && state.status === 'running'; wave++) {
-    state.wave.current = wave;
-    const waveStart = completed;
-    const waveEnd = Math.min(completed + waveSize, targetCount);
-
-    log(`🌊 Wave ${wave}/${totalWaves} starting (search ${waveStart + 1}-${waveEnd})`);
+    state.mobile.enabled = enabled;
     broadcastState();
-
-    for (let i = waveStart; i < waveEnd && state.status === 'running'; i++) {
-      const keyword = getRandomKeyword();
-      log(`🔍 Search ${i + 1}/${targetCount}: ${keyword}`);
-
-      let result = await performSearch(keyword);
-
-      // Retry if failed
-      if (!result.success) {
-        for (let retry = 0; retry < config.maxRetries && !result.success; retry++) {
-          const retryKeyword = getRandomKeyword();
-          log(`🔄 Retry ${retry + 1}: ${retryKeyword}`, 'warning');
-          await sleep(5000);
-          result = await performSearch(retryKeyword);
-        }
-      }
-
-      if (result.success) {
-        completed++;
-        state.currentSearch = completed;
-        state.progress = `${completed}/${targetCount}`;
-        state.percent = Math.floor((completed / targetCount) * 100);
-        broadcastState();
-      } else {
-        log(`❌ Search failed: ${result.error}`, 'error');
-      }
-
-      // Delay between searches
-      if (state.status === 'running' && i < waveEnd - 1) {
-        const delay = randomDelay(config.minDelay, config.maxDelay);
-        log(`⏳ Delay ${Math.round(delay / 1000)}s...`);
-        await sleep(delay);
-      }
-    }
-
-    // ====== AFTER WAVE: Verify points actually changed ======
-    if (state.status === 'running' || state.status === 'cooldown') {
-      log(`📊 Wave ${wave} done — verifying points...`);
-      await sleep(3000); // Wait for MS to process
-      const afterWave = await fetchPointsQuiet();
-      if (afterWave.points !== null) {
-        const prevPoints = state.points.current;
-        recordPointSnapshot(afterWave.points, wave, `after_wave_${wave}`);
-        const waveDelta = (prevPoints !== null) ? afterWave.points - prevPoints : null;
-
-        if (waveDelta !== null && waveDelta > 0) {
-          log(`📊 Wave ${wave}: +${waveDelta} pts ✅ (total earned: +${state.points.earned})`, 'success');
-        } else if (waveDelta === 0) {
-          log(`⚠️ Wave ${wave}: 0 pts earned — searches may not be counting!`, 'warning');
-        } else if (waveDelta !== null && waveDelta < 0) {
-          log(`⚠️ Wave ${wave}: ${waveDelta} pts (points decreased?!)`, 'warning');
-        } else {
-          log(`📊 Wave ${wave}: ${afterWave.points.toLocaleString()} pts (no prev to compare)`);
-        }
-      } else {
-        log(`⚠️ Wave ${wave}: Could not verify points (${afterWave.source})`, 'warning');
-      }
-      broadcastState();
-    }
-
-    // Wave pause (except last wave)
-    if (wave < totalWaves && state.status === 'running') {
-      const pauseMin = config.wavePauseMin || 15;
-      const pauseMs = pauseMin * 60 * 1000 + randomInt(0, 60000);
-      const resumeAt = Date.now() + pauseMs;
-      state.status = 'cooldown';
-      state.cooldownUntil = resumeAt;
-      log(`[Cooldown] Wave ${wave + 1} resumes at ${new Date(resumeAt).toLocaleTimeString()}`, 'warning');
-      log(`😴 Wave pause: ${pauseMin}+ min before wave ${wave + 1}...`, 'warning');
-      broadcastState();
-      await sleep(pauseMs);
-      if (state.status === 'cooldown') {
-        state.status = 'running';
-        state.cooldownUntil = null;
-        log(`[Cooldown] Resuming wave ${wave + 1}/${totalWaves} now...`);
-        broadcastState();
-      }
-    }
-  }
-
-  // ====== FINAL: Summary ======
-  if (state.status === 'running' || state.status === 'cooldown') {
-    state.status = 'done';
-    state.percent = 100;
-    state.cooldownUntil = null;
-
-    // Final point check
-    log('📊 Final point verification...');
-    const final = await fetchPointsQuiet();
-    if (final.points !== null) {
-      recordPointSnapshot(final.points, totalWaves + 1, 'final');
-      const totalEarned = state.points.baseline !== null
-        ? final.points - state.points.baseline
-        : null;
-
-      if (totalEarned !== null) {
-        state.points.earned = totalEarned;
-        log(`✅ Done ${completed}/${targetCount} searches — Real earned: +${totalEarned} pts`, 'success');
-        if (totalEarned === 0) {
-          log('⚠️ 0 points earned total — account may have reached daily limit or searches not counting', 'warning');
-        }
-      } else {
-        log(`✅ Done ${completed}/${targetCount} searches — Points: ${final.points.toLocaleString()}`, 'success');
-      }
-    } else {
-      log(`✅ Completed ${completed}/${targetCount} searches (could not verify points)`, 'success');
-    }
-  }
-  broadcastState();
-}
-
-// ---- AUTOMATION: CHECK POINTS (manual button) ----
-async function checkPoints() {
-  let tab = null;
-  try {
-    log('⭐ Checking points...');
-    tab = await createTab('https://rewards.bing.com/', false);
-    await waitForTabLoad(tab.id);
-    await sleep(5000);
-
-    const result = await injectScript(tab.id, () => {
-      return (async function() {
-        let result = { points: null, status: 'UNKNOWN', breakdown: null };
-
-        // BAN DETECTION
-        const bodyText = document.body?.innerText || '';
-        if (bodyText.match(/suspended|tạm ngưng|bị khóa|vi phạm/i)) {
-          result.status = 'BANNED';
-          return result;
-        }
-
-        // METHOD 1: Full API (lấy cả breakdown)
-        try {
-          const r = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
-            cache: 'no-cache'
-          });
-          if (r.ok) {
-            const data = await r.json();
-            const us = data?.dashboard?.userStatus;
-            if (us) {
-              result.points = us.availablePoints;
-              result.status = 'OK';
-              // Lấy thêm thông tin breakdown nếu có
-              result.breakdown = {
-                available: us.availablePoints,
-                lifetime: us.lifetimePoints || null,
-                redeemable: us.redeemablePoints || null,
-                level: us.levelInfo?.activeLevel || null
-              };
-              // Lấy counters (PC search, mobile search, edge bonus)
-              const counters = data?.dashboard?.userStatus?.counters;
-              if (counters) {
-                result.breakdown.counters = {};
-                for (const [key, val] of Object.entries(counters)) {
-                  if (val?.complete !== undefined && val?.pointProgress !== undefined) {
-                    result.breakdown.counters[key] = {
-                      progress: val.pointProgress,
-                      max: val.pointProgressMax,
-                      complete: val.complete
-                    };
-                  }
-                }
-              }
-              return result;
-            }
-          }
-        } catch (e) {}
-
-        // METHOD 2: DOM selectors (fallback)
-        const extractPoints = (text) => {
-          if (!text) return null;
-          const matches = text.match(/(\d{1,3}(?:[,.\s]\d{3})+|\d+)/g);
-          if (matches) {
-            const nums = matches.map(m => parseInt(m.replace(/[,.\s]/g, ''), 10))
-              .filter(n => !isNaN(n) && n >= 0 && n < 1000000)
-              .sort((a, b) => b - a);
-            for (const n of nums) { if (n >= 100) return n; }
-          }
-          return null;
-        };
-
-        const selectors = [
-          '.text-title1.font-semibold',
-          'p.text-title1.font-semibold',
-          '.flex.items-center.gap-2 > p',
-          '[class*="text-title1"]',
-          'mee-rewards-user-status-balance',
-          '#balanceToolTip',
-          '.pointsValue',
-          '[class*="balance"]'
-        ];
-
-        for (const sel of selectors) {
-          try {
-            const el = document.querySelector(sel);
-            if (el) {
-              const num = extractPoints(el.innerText || el.textContent);
-              if (num !== null) {
-                result.points = num;
-                result.status = 'OK';
-                return result;
-              }
-            }
-          } catch(e) {}
-        }
-
-        return result;
-      })();
-    });
-
-    await closeTab(tab.id);
-
-    if (result?.status === 'BANNED') {
-      state.status = 'error';
-      log('🚫 ACCOUNT BANNED / SUSPENDED!', 'error');
-    } else if (result?.status === 'OK' && result.points !== null) {
-      // Update state with real data
-      const prevPoints = state.points.current;
-      state.points.current = result.points;
-      state.points.lastCheck = Date.now();
-
-      // If we have a baseline, show real earned
-      if (state.points.baseline !== null) {
-        state.points.earned = result.points - state.points.baseline;
-        log(`⭐ Points: ${result.points.toLocaleString()} (earned: +${state.points.earned} since baseline)`, 'success');
-      } else {
-        // No baseline yet — set this as baseline
-        state.points.baseline = result.points;
-        state.points.earned = 0;
-        log(`⭐ Points: ${result.points.toLocaleString()} (set as baseline)`, 'success');
-      }
-
-      // Show delta since last check
-      if (prevPoints !== null && prevPoints !== result.points) {
-        const delta = result.points - prevPoints;
-        log(`   Δ ${delta > 0 ? '+' : ''}${delta} since last check`);
-      }
-
-      // Show breakdown if available
-      if (result.breakdown?.counters) {
-        for (const [key, val] of Object.entries(result.breakdown.counters)) {
-          const name = key.replace(/([A-Z])/g, ' $1').trim();
-          const pct = val.max > 0 ? Math.round((val.progress / val.max) * 100) : 0;
-          log(`   📈 ${name}: ${val.progress}/${val.max} (${pct}%) ${val.complete ? '✅' : ''}`);
-        }
-      }
-
-      recordPointSnapshot(result.points, state.wave.current, 'manual_check');
-    } else {
-      log('⚠️ Could not read points (API + DOM both failed)', 'warning');
-    }
+    return true;
+  } catch (error) {
+    state.mobileRuleEnabled = false;
+    state.mobile.enabled = false;
     broadcastState();
-
-  } catch (e) {
-    if (tab) await closeTab(tab.id);
-    log(`❌ Points check failed: ${e.message}`, 'error');
-  }
-}
-
-const TASK_URL_BLACKLIST = ['referandearn', 'explore', 'edge', 'install', 'app', 'purchase'];
-const REWARDS_PATH_BLACKLIST = new Set(['/', '/welcome', '/pointsbreakdown', '/starbonusdistribution']);
-
-function normalizeTaskUrl(rawUrl) {
-  if (typeof rawUrl !== 'string') return null;
-
-  const trimmedUrl = rawUrl.trim();
-  if (!trimmedUrl || trimmedUrl.startsWith('/')) return null;
-
-  try {
-    const parsedUrl = new URL(trimmedUrl);
-    const protocol = parsedUrl.protocol.toLowerCase();
-    const host = parsedUrl.hostname.toLowerCase();
-    const path = (parsedUrl.pathname.replace(/\/+$/, '') || '/').toLowerCase();
-
-    if (protocol !== 'http:' && protocol !== 'https:') return null;
-    if (TASK_URL_BLACKLIST.some((keyword) => parsedUrl.href.toLowerCase().includes(keyword))) return null;
-
-    if (host === 'rewards.bing.com') {
-      if (REWARDS_PATH_BLACKLIST.has(path) || path.startsWith('/dashboard')) {
-        return null;
-      }
-    }
-
-    parsedUrl.hash = '';
-    return parsedUrl.toString();
-  } catch (e) {
-    return null;
-  }
-}
-
-function getTaskDedupKey(url) {
-  try {
-    const parsedUrl = new URL(url);
-    const host = parsedUrl.hostname.toLowerCase();
-    const path = parsedUrl.pathname.toLowerCase();
-
-    // Microsoft often duplicates the same Bing search task with different tracking params.
-    if ((host === 'www.bing.com' || host === 'bing.com') && path === '/search') {
-      const query = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
-      if (query) return `${host}${path}?q=${query}`;
-    }
-
-    return `${host}${path}${parsedUrl.search}`;
-  } catch (e) {
-    return url;
-  }
-}
-
-function isBlockedTaskUrl(url) {
-  return !normalizeTaskUrl(url);
-}
-
-function scanUncompletedTasks(dashboard) {
-  const uniqueUrls = new Map();
-  const visited = new WeakSet();
-
-  const toNumber = (value) => {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  };
-
-  const isTaskIncomplete = (task) => {
-    const maxProgress = toNumber(task.pointProgressMax);
-
-    if (maxProgress !== null) {
-      // Punch cards can stay half-done, so progress is the real completion signal.
-      const currentProgress = Math.max(0, toNumber(task.pointProgress) ?? 0);
-      return currentProgress < maxProgress;
-    }
-
-    if (typeof task.complete === 'boolean') {
-      return task.complete === false;
-    }
-
-    if (typeof task.complete === 'string') {
-      return task.complete.toLowerCase() === 'false';
-    }
-
-    // Skip wrapper nodes that expose a URL but no trustworthy completion state.
+    log(`[Mobile] Failed to ${enabled ? 'enable' : 'disable'} UA rules: ${error.message}`, 'error');
     return false;
-  };
-
-  const visit = (node) => {
-    if (!node || typeof node !== 'object') return;
-    if (visited.has(node)) return;
-    visited.add(node);
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-      }
-      return;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(node, 'destinationUrl')) {
-      const url = normalizeTaskUrl(node.destinationUrl);
-
-      if (url && isTaskIncomplete(node)) {
-        uniqueUrls.set(getTaskDedupKey(url), url);
-      }
-
-      // Stop descending here to avoid re-processing duplicated promo branches.
-      return;
-    }
-
-    for (const value of Object.values(node)) {
-      visit(value);
-    }
-  };
-
-  visit(dashboard);
-  return [...uniqueUrls.values()];
-}
-
-async function fetchPendingTaskUrls() {
-  log('[API] Loading Microsoft Rewards dashboard...');
-
-  try {
-    const apiRes = await fetch('https://rewards.bing.com/api/getuserinfo?type=1');
-    if (!apiRes.ok) {
-      log(`[API Error] HTTP ${apiRes.status} while loading dashboard`, 'error');
-      return [];
-    }
-
-    const dbData = await apiRes.json();
-    const dashboard = dbData.dashboard || {};
-    const apiUrls = scanUncompletedTasks(dashboard);
-    log(`[API] Found ${apiUrls.length} pending tasks.`);
-    return apiUrls;
-  } catch (e) {
-    log(`[API Error] Failed to load dashboard: ${e.message}`, 'error');
-    return [];
   }
 }
 
-async function fetchRewardsDashboard() {
-  const apiRes = await fetch('https://rewards.bing.com/api/getuserinfo?type=1', {
-    cache: 'no-cache'
-  });
-
-  if (!apiRes.ok) {
-    throw new Error(`Rewards API HTTP ${apiRes.status}`);
+function logMobileEnvironment(snapshot, contextLabel) {
+  if (!snapshot?.signals) {
+    log(`[Mobile] ${contextLabel}: page signals unavailable`, 'warning');
+    return;
   }
 
-  const data = await apiRes.json();
-  return data?.dashboard || null;
+  const missingSignals = [];
+  if (!snapshot.signals.uaMobile) missingSignals.push('navigator.userAgent');
+  if (!snapshot.signals.uaDataMobile) missingSignals.push('navigator.userAgentData.mobile');
+  if (!snapshot.signals.touch) missingSignals.push('touch');
+  if (!snapshot.signals.mobileViewport) missingSignals.push('viewport');
+
+  if (missingSignals.length) {
+    log(`[Mobile] ${contextLabel}: page is not fully mobile (${missingSignals.join(', ')})`, 'warning');
+  } else {
+    log(`[Mobile] ${contextLabel}: mobile signals OK (${snapshot.summary || 'ready'})`);
+  }
 }
 
-function getPendingMobileCounterInfo(dashboard) {
-  const counters = dashboard?.userStatus?.counters;
-  if (!counters || typeof counters !== 'object') return null;
+async function createSearchSession(options = {}) {
+  const tab = await createTab(BING_HOME_URL, false);
+  await waitForTabLoad(tab.id);
 
-  for (const [key, value] of Object.entries(counters)) {
-    if (!/mobile/i.test(key)) continue;
-    if (!value || typeof value !== 'object') continue;
+  const snapshot = await callAutomationMethod(
+    tab.id,
+    'prepareEnvironment',
+    [{ mobile: Boolean(options.mobile) }],
+    { retries: 2 }
+  );
 
-    const progress = Number(value.pointProgress);
-    const max = Number(value.pointProgressMax);
-    const complete = value.complete === true;
+  if (options.mobile) {
+    logMobileEnvironment(snapshot, `${options.label || 'Mobile'} session`);
+  }
 
-    if (!Number.isFinite(max) || max <= 0) continue;
-    if (complete) continue;
+  return {
+    tabId: tab.id,
+    mobile: Boolean(options.mobile),
+    label: options.label || 'Search'
+  };
+}
 
-    const safeProgress = Number.isFinite(progress) ? progress : 0;
-    if (safeProgress < max) {
+async function closeSearchSession(session) {
+  if (!session?.tabId) return;
+  await closeTab(session.tabId);
+}
+
+async function performSearch(session, keyword) {
+  const tab = await getTab(session.tabId);
+  if (!tab) {
+    throw new Error('Search session tab was closed');
+  }
+
+  if (!/bing\.com/i.test(tab.url || '')) {
+    await navigateTab(session.tabId, BING_HOME_URL);
+  }
+
+  await callAutomationMethod(
+    session.tabId,
+    'prepareEnvironment',
+    [{ mobile: session.mobile }],
+    { retries: 2 }
+  ).catch(() => null);
+
+  let submitResult = await callAutomationMethod(
+    session.tabId,
+    'typeAndSearch',
+    [keyword, { mobile: session.mobile }],
+    {
+      retries: 2,
+      allowDestroyedContext: true
+    }
+  );
+
+  if (!submitResult?.success) {
+    const directSearchUrl = new URL('/search', BING_HOME_URL);
+    directSearchUrl.searchParams.set('q', keyword);
+    await navigateTab(session.tabId, directSearchUrl.toString());
+    submitResult = {
+      success: true,
+      fallback: 'tabs_update'
+    };
+  } else {
+    await waitWithStop(1200);
+    await waitForTabLoad(session.tabId).catch(() => null);
+  }
+
+  await waitWithStop(randomInt(1200, 2200));
+
+  await callAutomationMethod(
+    session.tabId,
+    'enhancedSearchInteraction',
+    [{ mobile: session.mobile }],
+    { retries: 2 }
+  ).catch(() => null);
+
+  return {
+    success: true,
+    keyword,
+    result: submitResult
+  };
+}
+
+async function verifySearchOutcome(beforeSnapshot, type, options = {}) {
+  const preferredKey = options.preferredKey || null;
+  const beforeCounter = getSnapshotCounter(beforeSnapshot, type, preferredKey);
+  let latestSnapshot = beforeSnapshot;
+  let latestCounter = beforeCounter;
+
+  for (let attempt = 1; attempt <= SEARCH_VERIFY_ATTEMPTS; attempt += 1) {
+    await waitWithStop(SEARCH_VERIFY_DELAY_MS + randomInt(200, 1200));
+    const afterSnapshot = await fetchRewardsDashboard({
+      context: `${options.label || 'search'} verify ${attempt}`,
+      silent: true
+    });
+
+    const afterCounter = getSnapshotCounter(afterSnapshot, type, beforeCounter?.key || preferredKey);
+    latestSnapshot = afterSnapshot;
+    latestCounter = afterCounter;
+
+    let counted = false;
+    let mode = 'counter';
+    let confidence = 'high';
+
+    if (beforeCounter && afterCounter && afterCounter.progress > beforeCounter.progress) {
+      counted = true;
+    } else if (
+      type === 'pc'
+      && Number.isFinite(beforeSnapshot.availablePoints)
+      && Number.isFinite(afterSnapshot.availablePoints)
+      && afterSnapshot.availablePoints > beforeSnapshot.availablePoints
+    ) {
+      counted = true;
+      mode = 'availablePoints';
+      confidence = 'medium';
+    } else if (!beforeCounter && !afterCounter) {
+      mode = 'availablePoints';
+      confidence = 'low';
+    }
+
+    state.verification.lastVerifiedDelta = {
+      type,
+      mode,
+      counted,
+      confidence,
+      attempt,
+      beforeCounter: cloneCounter(beforeCounter),
+      afterCounter: cloneCounter(afterCounter),
+      beforePoints: beforeSnapshot.availablePoints,
+      afterPoints: afterSnapshot.availablePoints
+    };
+    broadcastState();
+
+    if (counted) {
       return {
-        key,
-        progress: safeProgress,
-        max,
-        remaining: max - safeProgress
+        counted,
+        mode,
+        confidence,
+        afterSnapshot,
+        afterCounter
       };
     }
   }
 
-  return null;
+  return {
+    counted: false,
+    mode: beforeCounter ? 'counter' : 'availablePoints',
+    confidence: beforeCounter ? 'high' : 'low',
+    afterSnapshot: latestSnapshot,
+    afterCounter: latestCounter
+  };
 }
 
-async function runMobileSearchAutomation(targetCount) {
-  const config = await getConfig();
-  const safeTarget = Math.max(0, Number(targetCount) || 0);
-  let completed = 0;
+async function maybeRunWaveCooldown(processedCount, targetCount, config, label) {
+  const waveSize = Math.max(0, Number(config.waveSize) || 0);
+  const wavePauseMin = Math.max(0, Number(config.wavePauseMin) || 0);
 
-  for (let i = 0; i < safeTarget && state.status === 'running'; i++) {
-    const keyword = getRandomKeyword();
-    log(`[Mobile] Search ${i + 1}/${safeTarget}: ${keyword}`);
+  if (!waveSize || !wavePauseMin) return;
+  if (processedCount <= 0 || processedCount >= targetCount) return;
+  if (processedCount % waveSize !== 0) return;
 
-    let result = await performSearch(keyword);
+  state.status = 'cooldown';
+  state.wave = {
+    current: Math.floor(processedCount / waveSize),
+    total: Math.ceil(targetCount / waveSize)
+  };
+  state.cooldownUntil = Date.now() + (wavePauseMin * 60 * 1000);
+  state.progress = `${label} cooldown`;
+  broadcastState();
+  log(`[Wave] Cooldown ${wavePauseMin} minute(s) after ${processedCount}/${targetCount} ${label.toLowerCase()}.`, 'warning');
+
+  try {
+    await waitWithStop(wavePauseMin * 60 * 1000);
+  } finally {
+    state.status = 'running';
+    state.cooldownUntil = null;
+    broadcastState();
+  }
+}
+
+async function runTaskUrl(task, options = {}) {
+  let taskTab = null;
+  const openTabsBefore = await getOpenTabIdSet();
+
+  try {
+    taskTab = await createTab(task.url, false);
+    await waitForTabLoad(taskTab.id);
+
+    const loadedTab = await getTab(taskTab.id);
+    if (isInjectableAutomationUrl(loadedTab?.url || '')) {
+      await callAutomationMethod(
+        taskTab.id,
+        'runTaskPageInteraction',
+        [{ mobile: Boolean(options.mobile) }],
+        { retries: 2 }
+      ).catch(() => null);
+    }
+
+    await waitWithStop(TASK_SETTLE_DELAY_MS);
+    await closeNewRewardsTabs(openTabsBefore, taskTab.id ? [taskTab.id] : []);
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message
+    };
+  } finally {
+    if (taskTab?.id) {
+      await closeTab(taskTab.id);
+    }
+  }
+}
+
+function updateTaskStateFromSnapshot(snapshot) {
+  state.tasks.pending = snapshot.pendingTasks.length;
+  state.tasks.lastOutcome = `Pending ${snapshot.pendingTasks.length}`;
+  syncTaskProgress(true);
+}
+
+async function runTaskList(taskList, currentSnapshot, options = {}) {
+  let snapshot = currentSnapshot;
+  const sourceLabel = options.sourceLabel || 'api';
+
+  const normalizedTasks = taskList
+    .map((task) => ({
+      ...task,
+      url: normalizeTaskUrl(task.url),
+      dedupKey: task.dedupKey || getTaskDedupKey(task.url)
+    }))
+    .filter((task) => task.url && task.dedupKey)
+    .filter((task) => isSupportedTaskUrl(task.url))
+    .filter((task) => !runtimeMemory.attemptedTaskKeys.has(task.dedupKey));
+
+  if (!normalizedTasks.length) {
+    return snapshot;
+  }
+
+  state.tasks.planned = Math.max(state.tasks.planned, state.tasks.executed + normalizedTasks.length);
+  state.tasks.lastSource = sourceLabel;
+  state.tasks.lastOutcome = `Running ${normalizedTasks.length} ${sourceLabel} task(s)`;
+  syncTaskProgress(true);
+
+  for (const task of normalizedTasks) {
+    if (state.status === 'stopped') {
+      throw new Error(USER_STOPPED_ERROR);
+    }
+
+    runtimeMemory.attemptedTaskKeys.add(task.dedupKey);
+    const beforeSnapshot = snapshot;
+    log(`[Tasks] Opening ${task.url}`, 'info');
+
+    const result = await runTaskUrl(task, { mobile: Boolean(options.mobile) });
+    state.tasks.executed += 1;
+
     if (!result.success) {
-      for (let retry = 0; retry < config.maxRetries && !result.success; retry++) {
-        const retryKeyword = getRandomKeyword();
-        log(`[Mobile] Retry ${retry + 1}: ${retryKeyword}`, 'warning');
-        await sleep(4000);
-        result = await performSearch(retryKeyword);
-      }
+      state.tasks.lastOutcome = `Task failed: ${task.url}`;
+      syncTaskProgress(true);
+      log(`[Tasks] Failed: ${result.error}`, 'warning');
+      continue;
     }
 
-    if (result.success) {
-      completed++;
+    snapshot = await fetchRewardsDashboard({
+      context: `${sourceLabel} task verify`,
+      silent: true
+    });
+
+    const pointsDelta = Number.isFinite(beforeSnapshot.availablePoints) && Number.isFinite(snapshot.availablePoints)
+      ? snapshot.availablePoints - beforeSnapshot.availablePoints
+      : 0;
+
+    const completed = snapshot.pendingTasks.length < beforeSnapshot.pendingTasks.length || pointsDelta > 0;
+    if (completed) {
+      state.tasks.completed += 1;
+      log(`[Tasks] Counted (${formatSignedDelta(pointsDelta)})`, 'success');
     } else {
-      log(`[Mobile] Search failed: ${result.error}`, 'error');
+      log('[Tasks] No API-confirmed progress after task', 'warning');
     }
 
-    if (state.status === 'running' && i < safeTarget - 1) {
-      await sleep(randomDelay(config.minDelay, config.maxDelay));
+    updateTaskStateFromSnapshot(snapshot);
+    await waitWithStop(randomInt(1800, 3200));
+
+    if (!snapshot.pendingTasks.length) {
+      break;
     }
   }
 
-  return completed;
+  return snapshot;
 }
 
-async function startSmartAutomation() {
-  if (state.status === 'running') {
-    log('[Start] Already running.', 'warning');
+async function runApiTasksFirst(currentSnapshot) {
+  state.tasks.planned = currentSnapshot.pendingTasks.length;
+  state.tasks.pending = currentSnapshot.pendingTasks.length;
+  state.tasks.lastSource = 'api';
+  syncTaskProgress(true);
+
+  if (!currentSnapshot.pendingTasks.length) {
+    log('[Tasks] Microsoft API reports no pending daily tasks.');
+    return currentSnapshot;
+  }
+
+  log(`[Tasks] API reported ${currentSnapshot.pendingTasks.length} pending task(s).`);
+  return runTaskList(currentSnapshot.pendingTasks, currentSnapshot, {
+    sourceLabel: 'api',
+    mobile: false
+  });
+}
+
+async function collectDashboardFallbackTasks(options = {}) {
+  let dashboardTab = null;
+
+  try {
+    dashboardTab = await createTab(REWARDS_HOME_URL, false);
+    await waitForTabLoad(dashboardTab.id);
+    await waitWithStop(1800);
+
+    const result = await callAutomationMethod(
+      dashboardTab.id,
+      'collectDashboardTaskLinks',
+      [{ mobile: Boolean(options.mobile) }],
+      { retries: 2 }
+    );
+
+    const tasks = Array.isArray(result?.tasks) ? result.tasks : [];
+    return tasks
+      .map((task) => ({
+        url: normalizeTaskUrl(task.url),
+        text: task.text || '',
+        dedupKey: getTaskDedupKey(task.url)
+      }))
+      .filter((task) => task.url && task.dedupKey);
+  } finally {
+    if (dashboardTab?.id) {
+      await closeTab(dashboardTab.id);
+    }
+  }
+}
+
+async function runDashboardFallbackTasks(currentSnapshot, options = {}) {
+  if (!currentSnapshot.pendingTasks.length) {
+    log('[Tasks] No pending tasks remain before dashboard fallback.');
+    return currentSnapshot;
+  }
+
+  const fallbackTasks = await collectDashboardFallbackTasks(options);
+  const pendingKeys = new Set(currentSnapshot.pendingTasks.map((task) => task.dedupKey));
+
+  const filteredTasks = fallbackTasks.filter((task) => {
+    if (runtimeMemory.attemptedTaskKeys.has(task.dedupKey)) {
+      return false;
+    }
+
+    return pendingKeys.size === 0 || pendingKeys.has(task.dedupKey);
+  });
+
+  if (!filteredTasks.length) {
+    state.tasks.fallbackUsed = true;
+    state.tasks.lastSource = 'dashboard';
+    state.tasks.lastOutcome = 'Dashboard fallback found no new tasks';
+    syncTaskProgress(true);
+    log('[Tasks] Dashboard fallback found no actionable task links.', 'warning');
+    return currentSnapshot;
+  }
+
+  state.tasks.fallbackUsed = true;
+  log(`[Tasks] Dashboard fallback found ${filteredTasks.length} task link(s).`);
+  return runTaskList(filteredTasks, currentSnapshot, {
+    sourceLabel: 'dashboard',
+    mobile: Boolean(options.mobile)
+  });
+}
+
+async function runVerifiedSearchBatch(type, currentSnapshot, requestedCount) {
+  const config = await getConfig();
+  const isMobile = type === 'mobile';
+  const branch = state[type];
+  const delayRange = getSearchDelayRange(config, isMobile);
+  const label = isMobile ? 'Mobile' : 'PC';
+  let snapshot = currentSnapshot;
+  let session = null;
+
+  await ensureKeywordPoolReady();
+
+  const initialCounter = getSnapshotCounter(snapshot, type);
+  const requestedTarget = Math.max(0, Number(requestedCount) || 0);
+
+  if (isMobile && !initialCounter) {
+    branch.status = 'done';
+    branch.planned = 0;
+    branch.lastOutcome = 'Mobile counter unavailable';
+    branch.verificationBadge = FALLBACK_BADGE;
+    updateSummaryBadge();
+    syncSearchProgress(type, true);
+    log('[Mobile] Rewards API did not expose a reliable mobile counter. Skipping mobile batch.', 'warning');
+    return snapshot;
+  }
+
+  const tierLimit = TIER_LIMITS[config.rewardsLevel]?.maxSearch || DEFAULT_CONFIG.searchCount;
+  const cappedRequested = isMobile ? requestedTarget : Math.min(requestedTarget, tierLimit);
+  const safeTarget = initialCounter
+    ? Math.min(cappedRequested, initialCounter.remaining)
+    : cappedRequested;
+
+  branch.status = 'preparing';
+  branch.planned = safeTarget;
+  branch.executed = 0;
+  branch.counted = 0;
+  branch.verificationMode = initialCounter ? 'counter' : 'availablePoints';
+  branch.verificationBadge = initialCounter ? SUCCESS_BADGE : FALLBACK_BADGE;
+  branch.lastOutcome = initialCounter
+    ? `Preparing ${label.toLowerCase()} baseline`
+    : `Preparing ${label.toLowerCase()} fallback verification`;
+  setBranchCounterState(type, initialCounter);
+  state.totalSearches = safeTarget;
+  state.currentSearch = 0;
+  state.wave = {
+    current: 0,
+    total: config.waveSize > 0 ? Math.ceil(Math.max(1, safeTarget) / config.waveSize) : 0
+  };
+  syncSearchProgress(type, true);
+  updateSummaryBadge();
+
+  if (initialCounter) {
+    log(`[${label}] Counter before: ${formatCounter(initialCounter)}`);
+  } else {
+    log(`[${label}] No reliable counter detected. Falling back to available points.`, 'warning');
+  }
+
+  if (safeTarget <= 0) {
+    branch.status = 'done';
+    branch.lastOutcome = `${label} target already complete`;
+    syncSearchProgress(type, true);
+    log(`[${label}] Nothing left to do for this batch.`);
+    return snapshot;
+  }
+
+  try {
+    session = await createSearchSession({
+      mobile: isMobile,
+      label
+    });
+
+    branch.status = 'searching';
+    syncSearchProgress(type, true);
+
+    for (let index = 1; index <= safeTarget; index += 1) {
+      if (state.status === 'stopped') {
+        throw new Error(USER_STOPPED_ERROR);
+      }
+
+      const beforeSnapshot = snapshot;
+      const preferredKey = branch.counter?.key || getSnapshotCounter(beforeSnapshot, type)?.key || null;
+      let counted = false;
+
+      state.currentSearch = index;
+      syncSearchProgress(type, true);
+
+      for (let retry = 0; retry <= config.maxRetries; retry += 1) {
+        const keyword = getDiversifiedKeyword(type);
+        branch.lastOutcome = `${label} ${index}/${safeTarget} attempt ${retry + 1}`;
+        syncSearchProgress(type, true);
+
+        const searchResult = await performSearch(session, keyword);
+        if (!searchResult.success) {
+          log(`[${label}] Search submit failed`, 'warning');
+          continue;
+        }
+
+        branch.executed += 1;
+        log(`[${label}] Search ${index} executed with "${keyword}"`);
+        syncSearchProgress(type, true);
+
+        const verification = await verifySearchOutcome(beforeSnapshot, type, {
+          preferredKey,
+          label
+        });
+
+        snapshot = verification.afterSnapshot || snapshot;
+        if (verification.afterCounter) {
+          setBranchCounterState(type, verification.afterCounter);
+          log(`[${label}] Counter after: ${formatCounter(verification.afterCounter)}`);
+        }
+
+        if (verification.counted) {
+          branch.counted += 1;
+          branch.verificationMode = verification.mode;
+          branch.verificationBadge = verification.mode === 'counter' ? SUCCESS_BADGE : FALLBACK_BADGE;
+          branch.lastConfidence = verification.confidence;
+          branch.lastOutcome = `${label} ${index}/${safeTarget} counted`;
+          syncSearchProgress(type, true);
+          updateSummaryBadge();
+          log(`[${label}] Search ${index} counted`, 'success');
+          counted = true;
+          break;
+        }
+
+        branch.lastOutcome = `${label} ${index}/${safeTarget} not counted`;
+        syncSearchProgress(type, true);
+        log(`[${label}] Search ${index} was not confirmed by API`, 'warning');
+
+        if (retry < config.maxRetries) {
+          await waitWithStop(randomDelay(delayRange.min, delayRange.max));
+        }
+      }
+
+      if (!counted) {
+        log(`[${label}] Search ${index} exhausted retries`, 'warning');
+      }
+
+      const activeCounter = getSnapshotCounter(snapshot, type, branch.counter?.key || null);
+      if (activeCounter) {
+        setBranchCounterState(type, activeCounter);
+        if (activeCounter.remaining <= 0) {
+          break;
+        }
+      }
+
+      if (index < safeTarget) {
+        await maybeRunWaveCooldown(index, safeTarget, config, `${label} searches`);
+        const delay = randomDelay(delayRange.min, delayRange.max);
+        log(`[${label}] Delay ${Math.round(delay / 1000)}s before next search...`);
+        await waitWithStop(delay);
+      }
+    }
+  } finally {
+    await closeSearchSession(session);
+  }
+
+  branch.status = 'done';
+  branch.remaining = getSnapshotCounter(snapshot, type, branch.counter?.key || null)?.remaining ?? branch.remaining;
+  branch.lastOutcome = `${label} search batch complete`;
+  syncSearchProgress(type, true);
+  updateSummaryBadge();
+  log(`[Summary] ${label} planned=${branch.planned}, executed=${branch.executed}, counted=${branch.counted}, remaining=${branch.remaining ?? 'n/a'}`);
+
+  return snapshot;
+}
+
+function finalizeRunState() {
+  stopKeepAlive();
+  state.cooldownUntil = null;
+  state.wave = { current: 0, total: 0 };
+
+  if (state.status === 'stopped') {
+    state.progress = 'Stopped';
+    state.percent = 0;
+  } else if (state.status !== 'error') {
+    state.status = 'done';
+    state.progress = 'Completed';
+    state.percent = 100;
+  }
+
+  broadcastState();
+}
+
+async function handleRunFailure(error, prefix) {
+  if (error.message === USER_STOPPED_ERROR) {
+    finalizeRunState();
     return;
   }
 
-  state.status = 'running';
-  state.progress = 'Tasks first';
-  state.percent = 0;
+  stopKeepAlive();
   state.cooldownUntil = null;
+  state.wave = { current: 0, total: 0 };
+  state.status = 'error';
+  state.progress = 'Error';
+  state.percent = 0;
+  log(`[${prefix}] ${error.message}`, 'error');
   broadcastState();
-
-  try {
-    log('[Start] Checking pending daily tasks before search...');
-    const pendingTaskUrls = await fetchPendingTaskUrls();
-
-    if (state.status !== 'running') return;
-
-    if (pendingTaskUrls.length > 0) {
-      log(`[Start] Found ${pendingTaskUrls.length} pending task URLs. Running tasks first...`);
-      await runDailyTasks(pendingTaskUrls);
-
-      const config = await getConfig();
-      if (config.mobileMode && state.status === 'running') {
-        await runMobileDailyTasks();
-      }
-
-      if (state.status === 'running') {
-        log('[Start] Daily tasks finished. Switching to search automation...');
-        await startSearchAutomation();
-      }
-      return;
-    }
-
-    log('[Start] No pending tasks found. Switching to search automation...');
-    await startSearchAutomation();
-  } catch (e) {
-    if (e.message !== 'USER_STOPPED') {
-      state.status = 'error';
-      state.cooldownUntil = null;
-      log(`[Start Error] ${e.message}`, 'error');
-      broadcastState();
-    }
-  }
 }
 
-// ---- AUTOMATION: DAILY TASKS ----
-async function runDailyTasks(prefetchedUrls = null) {
-  log(`[Daily Tasks] Bắt đầu tự động làm nhiệm vụ hàng ngày...`);
-  let dashTab = null;
-  let totalCompleted = 0;
-  let apiCompleted = 0;
-  let apiUrls = Array.isArray(prefetchedUrls) ? [...prefetchedUrls] : [];
+async function runStartAutomation() {
+  const config = await getConfig();
 
-  if (apiUrls.length === 0) {
-    apiUrls = await fetchPendingTaskUrls();
-  }
+  resetRuntimeState();
+  state.status = 'running';
+  state.progress = 'Baseline';
+  state.percent = 0;
+  broadcastState();
+  startKeepAlive();
 
   try {
-    if (apiUrls.length > 0) {
-      log(`[API Task] Bắt đầu xử lý ${apiUrls.length} nhiệm vụ...`);
-      for (const url of apiUrls) {
-        let taskTab = null;
-        try {
-          if (isBlockedTaskUrl(url)) continue;
+    log('[Keywords] Refreshing live Google Trends keyword pool...');
+    await refreshKeywordPool(true);
 
-          log(`🎯 Mở task: ${url.substring(0, 50)}...`);
-          taskTab = await createTab(url, false);
-          await waitForTabLoad(taskTab.id);
-          await sleep(4000);
-
-          await injectScript(taskTab.id, () => {
-            window.alert = () => { }; window.confirm = () => false; window.prompt = () => null;
-            const cancels = document.querySelectorAll('button[class*="cancel"], button[class*="close"]');
-            cancels.forEach(c => { try { c.click(); } catch (e) { } });
-          });
-
-          await sleep(1500);
-          await closeTab(taskTab.id);
-          totalCompleted++;
-          apiCompleted++;
-          await sleep(2000);
-        } catch (e) {
-          if (taskTab) await closeTab(taskTab.id);
-        }
-      }
-      log(`✅ Đã xong toàn bộ ${totalCompleted} nhiệm vụ theo API.`);
-    }
-
-    if (apiCompleted > 0) {
-      log('[Daily Tasks] API phase completed. Skipping dashboard fallback to avoid repetitive task loops.');
-      log(`✅ Daily tasks complete! Total: ${totalCompleted} actions`, 'success');
-      return { success: true, completed: totalCompleted };
-    }
-
-    log('📋 [Phase 3] Dashboard — clicking all task cards...');
-    dashTab = await createTab('https://rewards.bing.com/', false);
-    await waitForTabLoad(dashTab.id);
-    await sleep(5000);
-
-    const dashboardResult = await injectScript(dashTab.id, () => {
-      return (async function () {
-        const delay = ms => new Promise(r => setTimeout(r, ms));
-
-        // Scroll to load all lazy cards
-        document.body.style.scrollBehavior = 'auto';
-        const totalH = document.documentElement.scrollHeight;
-        let pos = 0;
-        while (pos < totalH) {
-          pos = Math.min(pos + 400, totalH);
-          window.scrollTo(0, pos);
-          await delay(250);
-        }
-        window.scrollTo(0, 0);
-        await delay(600);
-
-        const clicked = [];
-
-        // STRATEGY 1: Find <a> task cards — match React Aria disclosure panel cards
-        // Each card is <a target="_blank" href="bing.com/search?q=..." cursor-pointer>
-        const taskCards = document.querySelectorAll('a[href][target="_blank"][class*="cursor-pointer"]');
-
-        const skipUrlPatterns = [
-          /referandearn/i, /refer/i, /invite/i, /settings/i, /about/i,
-          /terms/i, /privacy/i, /profile/i, /account/i, /redeem/i,
-          /download/i, /microsoft\.com\/en-us\/edge/i, /bing\.com\/explore/i,
-          /app/i, /signup/i
-        ];
-
-        // Check if a task (card or parent) is completed
-        const isCompleted = (card) => {
-          // Check for checkmark/done elements
-          const checkElements = card?.querySelectorAll?.('.sw-checkmark, .completed, [class*="done"], [class*="checkmark"]');
-          if (checkElements?.length) return true;
-          // Check for "Completed"/"Hoàn thành" text (the dashboard shows "Completed" in a div)
-          const text = card?.textContent || '';
-          if (/completed|hoàn thành|đã hoàn thành/i.test(text)) return true;
-          return false;
-        };
-
-        for (const card of taskCards) {
-          const rect = card.getBoundingClientRect();
-          if (rect.width < 40 || rect.height < 30) continue;
-
-          const url = card.href || '';
-          const text = (card.textContent || '').trim().toLowerCase();
-
-          // Must be a bing or rewards task URL
-          if (!url.includes('bing.com') && !url.includes('rewards.bing.com')) continue;
-          if (skipUrlPatterns.some(p => p.test(url))) continue;
-
-          // Skip completed
-          if (isCompleted(card)) continue;
-
-          try {
-            const titleEl = card.querySelector('p[class*="line-clamp"]') || card.querySelector('[class*="Strong"]');
-            const title = titleEl ? titleEl.textContent.trim() : text.substring(0, 30);
-            const ptsEl = card.querySelector('[class*="caption1Stronger"]') || card.querySelector('[class*="statusInformative"]');
-            const pts = ptsEl ? ptsEl.textContent.trim() : '';
-
-            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await delay(800);
-            card.click();
-            clicked.push(`${title} (${pts || '?'} pts)`);
-            await delay(8000);
-          } catch (e) { }
-        }
-
-        // STRATEGY 2: XPath fallback by section header
-        if (clicked.length === 0) {
-          const headers = ['Daily Set', 'hàng ngày', 'hoạt động khác', 'More activities', 'Earn more', 'Nhiệm vụ phụ'];
-          for (const header of headers) {
-            try {
-              const xpath = `//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '${header.toLowerCase()}')]/ancestor::*[position() <= 3]//a[@href and contains(@href, 'bing.com')]`;
-              const result = document.evaluate(xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-              for (let i = 0; i < result.snapshotLength; i++) {
-                const link = result.snapshotItem(i);
-                if (link.closest('.sw-checkmark, .completed')) continue;
-                link.click();
-                clicked.push(`xpath:${header}`);
-                await delay(2000);
-              }
-            } catch (e) { }
-          }
-        }
-
-        return { clicked };
-      })();
+    log('[Start] Phase 1/6: fetch dashboard baseline');
+    let snapshot = await fetchRewardsDashboard({
+      context: 'baseline',
+      logCounters: true,
+      recordLabel: 'baseline'
     });
 
-    if (dashboardResult?.clicked?.length > 0) {
-      totalCompleted += dashboardResult.clicked.length;
-    } else {
-      log(`📦 Dashboard: No pending tasks found`);
+    if (Number.isFinite(snapshot.availablePoints)) {
+      applyBaselinePoints(snapshot.availablePoints);
+      log(`[Summary] Baseline points: ${snapshot.availablePoints}`);
     }
-    // Cleanup
-    await sleep(1500);
-    const finalTabs = await chrome.tabs.query({});
-    for (const t of finalTabs) {
-      if (t.id !== dashTab.id &&
-          !t.url?.startsWith('chrome://') &&
-          !t.url?.startsWith('chrome-extension://') &&
-          !t.url?.includes('rewards.bing.com')) {
-        if (t.url?.includes('bing.com') || t.url?.includes('msn.com') || t.url?.includes('microsoft.com')) {
-          await closeTab(t.id);
+
+    log('[Start] Phase 2/6: API daily tasks');
+    snapshot = await runApiTasksFirst(snapshot);
+
+    if (state.status === 'stopped') {
+      throw new Error(USER_STOPPED_ERROR);
+    }
+
+    if (config.mobileMode) {
+      log('[Start] Phase 3/6: enable mobile mode');
+      const enabled = await setMobileMode(true);
+      if (!enabled) {
+        throw new Error('Could not enable mobile UA rules');
+      }
+
+      try {
+        snapshot = await fetchRewardsDashboard({
+          context: 'mobile baseline',
+          silent: true
+        });
+
+        if (config.mobileSearchCount > 0) {
+          log('[Start] Phase 4/6: verified mobile search batch');
+          snapshot = await runVerifiedSearchBatch('mobile', snapshot, config.mobileSearchCount);
+        } else {
+          log('[Mobile] Mobile mode enabled with 0 mobile searches configured. Skipping mobile search batch.');
         }
+
+        if (state.status !== 'stopped' && snapshot.pendingTasks.length > 0) {
+          log('[Start] Phase 5/6: mobile dashboard fallback tasks');
+          snapshot = await runDashboardFallbackTasks(snapshot, { mobile: true });
+        }
+      } finally {
+        await setMobileMode(false);
+        log('[Mobile] Mobile mode disabled');
+      }
+    } else if (snapshot.pendingTasks.length > 0) {
+      log('[Start] Phase 4/6: desktop dashboard fallback tasks');
+      snapshot = await runDashboardFallbackTasks(snapshot, { mobile: false });
+    }
+
+    if (state.status === 'stopped') {
+      throw new Error(USER_STOPPED_ERROR);
+    }
+
+    log('[Start] Phase 5/6: verified PC search batch');
+    snapshot = await fetchRewardsDashboard({
+      context: 'pc baseline',
+      silent: true
+    });
+    snapshot = await runVerifiedSearchBatch('pc', snapshot, config.searchCount);
+
+    if (state.status === 'stopped') {
+      throw new Error(USER_STOPPED_ERROR);
+    }
+
+    log('[Start] Phase 6/6: final dashboard verification');
+    snapshot = await fetchRewardsDashboard({
+      context: 'final verification',
+      logCounters: true,
+      recordLabel: 'final'
+    });
+
+    if (Number.isFinite(snapshot.availablePoints)) {
+      applyCurrentPoints(snapshot.availablePoints, 'final');
+      state.summary.finalPoints = snapshot.availablePoints;
+      if (Number.isFinite(state.summary.baselinePoints)) {
+        state.summary.totalEarned = snapshot.availablePoints - state.summary.baselinePoints;
       }
     }
-    await closeTab(dashTab.id);
-    dashTab = null;
 
-    log(`✅ Daily tasks complete! Total: ${totalCompleted} actions`, 'success');
-    return { success: true, completed: totalCompleted };
-
-  } catch (e) {
-    if (dashTab) await closeTab(dashTab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    log(`❌ Daily tasks failed: ${e.message}`, 'error');
-    return { success: false, completed: totalCompleted, error: e.message };
+    updateSummaryBadge();
+    log(`[Summary] executed=${state.mobile.executed + state.pc.executed}, counted=${state.mobile.counted + state.pc.counted}, earned=${formatSignedDelta(state.summary.totalEarned)}`);
+    finalizeRunState();
+  } catch (error) {
+    await handleRunFailure(error, 'Start Error');
+  } finally {
+    await setMobileMode(false);
+    activeRunPromise = null;
   }
 }
 
-// ---- AUTOMATION: MOBILE DAILY TASKS ----
-async function runMobileDailyTasks() {
-  let tab = null;
-  let totalCompleted = 0;
+async function runDailyTasksOnlyAutomation() {
+  const config = await getConfig();
+
+  resetRuntimeState();
+  state.status = 'running';
+  state.progress = 'Tasks';
+  state.percent = 0;
+  broadcastState();
+  startKeepAlive();
 
   try {
-    const config = await getConfig();
-    log('[Mobile] Enabling mobile mode...');
-    await setMobileMode(true);
-    await sleep(500);
+    let snapshot = await fetchRewardsDashboard({
+      context: 'tasks baseline',
+      logCounters: true,
+      recordLabel: 'tasks_baseline'
+    });
 
-    let plannedMobileSearches = Math.max(1, config.mobileSearchCount || 5);
+    if (Number.isFinite(snapshot.availablePoints)) {
+      applyBaselinePoints(snapshot.availablePoints);
+      log(`[Summary] Baseline points: ${snapshot.availablePoints}`);
+    }
 
-    try {
-      const dashboard = await fetchRewardsDashboard();
-      const mobileCounter = getPendingMobileCounterInfo(dashboard);
+    snapshot = await runApiTasksFirst(snapshot);
 
-      if (mobileCounter) {
-        plannedMobileSearches = Math.min(plannedMobileSearches, Math.max(1, mobileCounter.remaining));
-        log(`[Mobile] Counter ${mobileCounter.key}: ${mobileCounter.progress}/${mobileCounter.max}`);
-        log(`[Mobile] Running ${plannedMobileSearches} mobile searches before DOM fallback...`);
+    if (state.status !== 'stopped' && snapshot.pendingTasks.length > 0) {
+      if (config.mobileMode) {
+        const enabled = await setMobileMode(true);
+        if (!enabled) {
+          throw new Error('Could not enable mobile UA rules for task fallback');
+        }
+
+        try {
+          snapshot = await runDashboardFallbackTasks(snapshot, { mobile: true });
+        } finally {
+          await setMobileMode(false);
+          log('[Mobile] Mobile mode disabled');
+        }
       } else {
-        log('[Mobile] No pending mobile counter exposed by API. Using best-effort mobile searches...', 'warning');
-      }
-    } catch (e) {
-      log(`[Mobile] API pre-check failed: ${e.message}. Using best-effort mobile searches...`, 'warning');
-    }
-
-    if (plannedMobileSearches > 0 && state.status === 'running') {
-      totalCompleted += await runMobileSearchAutomation(plannedMobileSearches);
-    }
-
-    // Open Bing in mobile mode
-    log('[Mobile] Opening Bing in mobile mode...');
-    tab = await createTab('https://www.bing.com/', false);
-    await waitForTabLoad(tab.id);
-    await sleep(3000);
-
-    log('[Mobile] Looking for mobile tasks...');
-    const mobileResult = await injectScript(tab.id, () => {
-      return (async function() {
-        const results = { found: 0, clicked: 0, taskNames: [], readArticleUrls: [] };
-        const delay = ms => new Promise(r => setTimeout(r, ms));
-
-        const clickElement = async (el) => {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          await delay(500);
-          if (el.href) { window.open(el.href, '_blank'); } else { el.click(); }
-          await delay(1000);
-        };
-
-        // Scroll down
-        for (let i = 0; i < 8; i++) {
-          window.scrollBy({ top: 300, behavior: 'smooth' });
-          await delay(600);
-        }
-        window.scrollTo(0, 0);
-        await delay(1000);
-
-        // MOBILE TASK 1: Rewards/Check-in
-        const rewardsSelectors = [
-          '[class*="rewards"]', '[id*="rewards"]', '[class*="checkin"]',
-          '[class*="check-in"]', '[class*="streak"]', '#id_rc',
-          '.rewards_flyout', '#rewardsApp'
-        ];
-        for (const sel of rewardsSelectors) {
-          try {
-            const els = document.querySelectorAll(sel);
-            for (const el of els) {
-              const rect = el.getBoundingClientRect();
-              if (rect.width < 20 || rect.height < 20) continue;
-              const text = el.textContent || '';
-              if (text.length > 200) continue;
-              const isClickable = el.tagName === 'A' || el.tagName === 'BUTTON' ||
-                el.style.cursor === 'pointer' || el.getAttribute('role') === 'button';
-              if (isClickable) {
-                results.found++;
-                results.taskNames.push('Rewards: ' + text.substring(0, 40).trim());
-                await clickElement(el);
-                results.clicked++;
-                await delay(3000);
-              }
-            }
-          } catch(e) {}
-        }
-
-        // MOBILE TASK 2: Read to Earn
-        const newsSelectors = [
-          '.news-card a', '[class*="news"] a[href]', '.infopane a[href]',
-          'a.story-card', '[class*="feed"] a[href]', '.content-card a',
-          'article a[href]', '.card a[href*="msn.com"]'
-        ];
-        for (const sel of newsSelectors) {
-          try {
-            const els = document.querySelectorAll(sel);
-            for (const el of els) {
-              const rect = el.getBoundingClientRect();
-              if (rect.width < 50 || rect.height < 30) continue;
-              if (el.href && !results.readArticleUrls.includes(el.href)) {
-                results.readArticleUrls.push(el.href);
-                if (results.readArticleUrls.length >= 5) break;
-              }
-            }
-          } catch(e) {}
-          if (results.readArticleUrls.length >= 5) break;
-        }
-        for (let i = 0; i < Math.min(3, results.readArticleUrls.length); i++) {
-          results.found++;
-          results.taskNames.push('Read: article ' + (i + 1));
-        }
-
-        // MOBILE TASK 3: Point-earning elements
-        const allClickable = document.querySelectorAll('a[href], button, [role="button"]');
-        for (const el of allClickable) {
-          if (results.clicked >= 10) break;
-          const text = el.textContent || '';
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 40 || rect.height < 30) continue;
-          if (el.closest('header') || el.closest('nav')) continue;
-          const hasPoints = text.match(/[+]\s*\d+|\b\d+\s*(pts|points)\b/i);
-          const hasTask = text.match(/(quiz|poll|trivia|daily|check.?in|earn|reward|complete|claim)/i);
-          if (hasPoints || hasTask) {
-            if (text.includes('Sign') || text.includes('Settings')) continue;
-            results.found++;
-            results.taskNames.push('Task: ' + text.substring(0, 40).trim());
-            await clickElement(el);
-            results.clicked++;
-            await delay(3000);
-          }
-        }
-        return { ...results, readArticleUrls: results.readArticleUrls.slice(0, 3) };
-      })();
-    });
-
-    const mobileData = mobileResult || { found: 0, clicked: 0, taskNames: [], readArticleUrls: [] };
-    totalCompleted += mobileData.clicked;
-    if (mobileData.taskNames?.length > 0) {
-      mobileData.taskNames.forEach(name => log(`   [Mobile] ${name}`));
-    }
-
-    // Read articles (dwell time)
-    const articleUrls = mobileData.readArticleUrls || [];
-    if (articleUrls.length > 0) {
-      log(`[Mobile] Read to Earn: opening ${articleUrls.length} articles...`);
-      for (const url of articleUrls) {
-        try {
-          await chrome.tabs.update(tab.id, { url });
-          await waitForTabLoad(tab.id).catch(() => {});
-          await sleep(2000);
-
-          await injectScript(tab.id, () => {
-            return (async function() {
-              const delay = ms => new Promise(r => setTimeout(r, ms));
-              const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-              const scrollCount = randomInt(15, 25);
-              for (let i = 0; i < scrollCount; i++) {
-                window.scrollBy({ top: randomInt(150, 400), behavior: 'smooth' });
-                await delay(randomInt(1000, 3000));
-                if (Math.random() < 0.2) {
-                  window.scrollBy({ top: -randomInt(50, 150), behavior: 'smooth' });
-                  await delay(randomInt(500, 1500));
-                }
-              }
-            })();
-          });
-
-          totalCompleted++;
-          log(`   [Mobile] Read article: ${url.substring(0, 60)}...`);
-          await sleep(1000);
-        } catch (e) {
-          log(`   [Mobile] Article read failed: ${e.message}`, 'warning');
-        }
+        snapshot = await runDashboardFallbackTasks(snapshot, { mobile: false });
       }
     }
 
-    // Mobile rewards dashboard
-    log('[Mobile] Checking mobile rewards dashboard...');
-    await chrome.tabs.update(tab.id, { url: 'https://rewards.bing.com/' });
-    await waitForTabLoad(tab.id).catch(() => {});
-    await sleep(4000);
-
-    const mobileDashResult = await injectScript(tab.id, () => {
-      return (async function() {
-        const results = { found: 0, clicked: 0, taskNames: [] };
-        const delay = ms => new Promise(r => setTimeout(r, ms));
-        for (let i = 0; i < 5; i++) {
-          window.scrollBy({ top: 300, behavior: 'smooth' });
-          await delay(500);
-        }
-        window.scrollTo(0, 0);
-        await delay(500);
-        const allClickable = document.querySelectorAll('a[href], button, [role="button"]');
-        for (const el of allClickable) {
-          if (results.clicked >= 8) break;
-          const text = el.textContent || '';
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 40 || rect.height < 25) continue;
-          if (el.closest('header') || el.closest('nav')) continue;
-          if (text.includes('Sign in') || text.includes('Redeem') || text.includes('About')) continue;
-          const hasPoints = text.match(/[+]\s*\d+|\b\d+\s*(pts|points)\b/i);
-          const hasCheck = el.querySelector('[class*="check"]');
-          if (hasPoints && !hasCheck) {
-            results.found++;
-            results.taskNames.push(text.substring(0, 40).trim());
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await delay(400);
-            if (el.href) { window.open(el.href, '_blank'); } else { el.click(); }
-            results.clicked++;
-            await delay(4000);
-          }
-        }
-        return results;
-      })();
+    snapshot = await fetchRewardsDashboard({
+      context: 'tasks final verification',
+      logCounters: true,
+      recordLabel: 'tasks_final'
     });
 
-    const mobileDash = mobileDashResult || { found: 0, clicked: 0, taskNames: [] };
-    totalCompleted += mobileDash.clicked;
-    if (mobileDash.taskNames?.length > 0) {
-      mobileDash.taskNames.forEach(n => log(`   [Mobile] Dashboard task: ${n}`));
+    if (Number.isFinite(snapshot.availablePoints)) {
+      applyCurrentPoints(snapshot.availablePoints, 'tasks_final');
+      state.summary.finalPoints = snapshot.availablePoints;
+      if (Number.isFinite(state.summary.baselinePoints)) {
+        state.summary.totalEarned = snapshot.availablePoints - state.summary.baselinePoints;
+      }
     }
 
-    // Disable mobile and cleanup
+    updateSummaryBadge();
+    log(`[Summary] Tasks executed=${state.tasks.executed}, completed=${state.tasks.completed}, pending=${snapshot.pendingTasks.length}, earned=${formatSignedDelta(state.summary.totalEarned)}`);
+    finalizeRunState();
+  } catch (error) {
+    await handleRunFailure(error, 'Tasks Error');
+  } finally {
     await setMobileMode(false);
-    await sleep(2000);
-    const allTabs = await chrome.tabs.query({});
-    for (const t of allTabs) {
-      if (t.id !== tab.id && (t.url?.includes('bing.com') || t.url?.includes('msn.com'))) {
-        await closeTab(t.id);
-      }
-    }
-    await closeTab(tab.id);
+    activeRunPromise = null;
+  }
+}
 
-    if (totalCompleted === 0) {
-      log('[Mobile] No actionable mobile task was found.', 'warning');
+async function checkPoints() {
+  const snapshot = await fetchRewardsDashboard({
+    context: 'manual check',
+    logCounters: true,
+    recordLabel: 'manual_check'
+  });
+
+  if (Number.isFinite(snapshot.availablePoints)) {
+    if (!Number.isFinite(state.points.baseline)) {
+      applyBaselinePoints(snapshot.availablePoints);
     } else {
-      log(`[Mobile] Completed ${totalCompleted} mobile actions.`, 'success');
+      applyCurrentPoints(snapshot.availablePoints, 'manual_check');
     }
-    return { success: true, completed: totalCompleted };
-
-  } catch (e) {
-    await setMobileMode(false);
-    if (tab) await closeTab(tab.id);
-    if (e.message === 'USER_STOPPED') throw e;
-    log(`[Mobile] Failed: ${e.message}`, 'error');
-    return { success: false, completed: 0, error: e.message };
   }
+
+  updateSummaryBadge();
+  broadcastState();
 }
 
-// ---- AUTOMATION: RESET PAGE ----
 async function resetPage() {
-  try {
-    log('[Reset] Resetting and cleaning tabs...');
-    const allTabs = await chrome.tabs.query({});
-    let closedCount = 0;
+  log('[Reset] Closing rewards-related tabs...');
 
-    // Find or create rewards tab
-    let rewardsTab = allTabs.find(t => t.url?.includes('rewards.bing.com'));
-    if (!rewardsTab) {
-      rewardsTab = await createTab('https://rewards.bing.com/', true);
-      await waitForTabLoad(rewardsTab.id).catch(() => {});
+  const tabs = await chrome.tabs.query({});
+  let rewardsTab = tabs.find((tab) => /rewards\.bing\.com/i.test(tab.url || ''));
+
+  for (const tab of tabs) {
+    if (rewardsTab && tab.id === rewardsTab.id) continue;
+    if (isRewardsRelatedUrl(tab.url)) {
+      await closeTab(tab.id);
     }
-
-    // Close non-essential tabs
-    for (const t of allTabs) {
-      if (t.id === rewardsTab.id) continue;
-      if (t.url?.includes('bing.com') || t.url?.includes('msn.com')) {
-        await closeTab(t.id);
-        closedCount++;
-      }
-    }
-
-    if (closedCount > 0) log(`🗑️ Closed ${closedCount} tabs`);
-
-    // Reload rewards tab
-    await chrome.tabs.reload(rewardsTab.id);
-    log('✅ Rewards page reloaded', 'success');
-    return { success: true };
-
-  } catch (e) {
-    log(`❌ Reset failed: ${e.message}`, 'error');
-    return { success: false, error: e.message };
   }
+
+  if (!rewardsTab) {
+    rewardsTab = await createTab(REWARDS_HOME_URL, true);
+    await waitForTabLoad(rewardsTab.id);
+  } else {
+    await chrome.tabs.reload(rewardsTab.id);
+    await waitForTabLoad(rewardsTab.id);
+  }
+
+  log('[Reset] Rewards page refreshed', 'success');
 }
 
-// ---- MESSAGE HANDLER ----
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'get_state') {
-    sendResponse({ state: getPublicState(), logs: state.logs.slice(0, 50) });
-    return true;
+async function startRun(kind) {
+  if (activeRunPromise) {
+    log('[Run] Another automation session is already active.', 'warning');
+    return;
   }
 
-  if (msg.action === 'get_config') {
-    getConfig().then(config => sendResponse({ config }));
-    return true;
-  }
-
-  if (msg.action === 'save_config') {
-    saveConfig(msg.config).then(() => {
-      log('⚙️ Config saved!', 'success');
-      sendResponse({ success: true });
+  activeRunPromise = (kind === 'tasks' ? runDailyTasksOnlyAutomation() : runStartAutomation())
+    .catch((error) => {
+      log(`[Run] ${error.message}`, 'error');
+    })
+    .finally(() => {
+      activeRunPromise = null;
     });
-    return true;
-  }
-
-  if (msg.action === 'command') {
-    handleCommand(msg.command);
-    sendResponse({ received: true });
-    return true;
-  }
-
-  return false;
-});
+}
 
 async function handleCommand(command) {
   switch (command) {
     case 'start_search':
-      if (state.status === 'running') { log('⚠️ Already running!', 'warning'); return; }
-      startSmartAutomation().catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Search Error: ${e.message}`, 'error');
-      });
-      break;
+      if (isRunActive() || activeRunPromise) {
+        log('[Start] Automation is already running.', 'warning');
+        return;
+      }
+      await startRun('full');
+      return;
+
+    case 'daily_tasks':
+      if (isRunActive() || activeRunPromise) {
+        log('[Tasks] Automation is already running.', 'warning');
+        return;
+      }
+      await startRun('tasks');
+      return;
 
     case 'stop':
       state.status = 'stopped';
+      state.progress = 'Stopped';
+      state.percent = 0;
       state.cooldownUntil = null;
-      log('⏹️ Stopped!', 'warning');
+      log('[Run] Stopped by user', 'warning');
       broadcastState();
-      break;
+      return;
 
     case 'check_points':
-      checkPoints().catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Point Check Error: ${e.message}`, 'error');
-      });
-      break;
-
-    case 'daily_tasks':
-      if (state.status === 'running') { log('⚠️ Already running!', 'warning'); return; }
-      state.status = 'running';
-      broadcastState();
-      
-      (async () => {
-        await runDailyTasks();
-        const config = await getConfig();
-        if (config.mobileMode && state.status === 'running') {
-          await runMobileDailyTasks();
-        }
-        if (state.status === 'running') state.status = 'idle';
-        state.cooldownUntil = null;
-        broadcastState();
-      })().catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Task Error: ${e.message}`, 'error');
-      });
-      break;
+      await checkPoints();
+      return;
 
     case 'reset_page':
-      resetPage().catch(e => {
-        if (e.message !== 'USER_STOPPED') log(`❌ Reset Error: ${e.message}`, 'error');
-      });
-      break;
+      await resetPage();
+      return;
 
     case 'reset_progress':
-      state.status = 'idle';
-      state.progress = '0/0';
-      state.percent = 0;
-      state.currentSearch = 0;
-      state.cooldownUntil = null;
-      state.points = { current: null, earned: 0, baseline: null, lastCheck: null, history: [] };
-      state.wave = { current: 0, total: 0 };
-      log('🔄 Progress + points reset', 'success');
+      state.status = 'stopped';
+      await setMobileMode(false);
+      stopKeepAlive();
+      state = createInitialState();
+      runtimeMemory = createRuntimeMemory();
+      log('[Reset] Runtime state cleared', 'success');
       broadcastState();
-      break;
+      return;
+
+    default:
+      log(`[Command] Unknown command: ${command}`, 'warning');
   }
 }
 
-// ---- KEEP-ALIVE ----
-chrome.alarms.create('keepAlive', { periodInMinutes: 1 });
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepAlive' && (state.status === 'running' || state.status === 'cooldown')) {
-    // Service worker stays alive while automation is active
-  }
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  (async () => {
+    if (message.action === 'get_state') {
+      sendResponse({
+        state: getPublicState(),
+        logs: state.logs.slice(0, 50)
+      });
+      return;
+    }
+
+    if (message.action === 'get_config') {
+      const config = await getConfig();
+      sendResponse({ config });
+      return;
+    }
+
+    if (message.action === 'save_config') {
+      const config = await saveConfig(message.config);
+      log('[Config] Saved', 'success');
+      sendResponse({ success: true, config });
+      return;
+    }
+
+    if (message.action === 'command') {
+      await handleCommand(message.command);
+      sendResponse({ received: true });
+      return;
+    }
+
+    sendResponse({ ok: false });
+  })().catch((error) => {
+    sendResponse({
+      success: false,
+      error: error.message
+    });
+  });
+
+  return true;
 });
 
-// ---- INIT ----
-log('⚡ Extension loaded', 'success');
+chrome.runtime.onInstalled.addListener(async () => {
+  const currentConfig = await getConfig();
+  await chrome.storage.local.set({ config: currentConfig });
+  await setMobileMode(false);
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  setMobileMode(false).catch(() => {});
+});
+
+resetRuntimeState();
+setMobileMode(false).catch(() => {});
+log('[Init] Background worker ready', 'success');
