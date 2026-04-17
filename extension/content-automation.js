@@ -1,5 +1,5 @@
 (function installRewardsAutomationApi() {
-  const VERSION = '5.0.0';
+  const VERSION = '5.1.0';
 
   if (window.__BRA__ && window.__BRA__.version === VERSION) {
     return;
@@ -35,6 +35,9 @@
     const safeMax = Math.floor(max);
     return Math.floor(Math.random() * (safeMax - safeMin + 1)) + safeMin;
   }
+
+  const DISMISS_TEXT_RE = /close|dismiss|not now|no thanks|skip|maybe later|got it|ok(?:ay)?|accept|agree|continue to site|continue without|stay on page|hide/i;
+  const BLOCKING_TEXT_RE = /cookie|consent|survey|edge|install|app|popup|pop-up|modal|overlay|dialog|newsletter|subscribe|sign in|signin|prompt|tip|offer/i;
 
   function nativeSetValue(element, value) {
     if (!element) return;
@@ -369,15 +372,7 @@
     }
 
     await sleep(randomInt(250, 500));
-
-    try {
-      document.querySelectorAll('[class*="overlay"], [class*="modal"], .b_overlay')
-        .forEach((element) => {
-          try {
-            element.style.display = 'none';
-          } catch (error) {}
-        });
-    } catch (error) {}
+    dismissBlockingUi();
 
     const searchInput = options.mobile ? await revealSearchInput() : findSearchInput();
 
@@ -414,37 +409,88 @@
       applyMobileProfile();
     }
 
-    await sleep(randomInt(options.mobile ? 1600 : 1000, options.mobile ? 2600 : 2000));
+    const scrollPlan = [];
+    const maxBaseStep = options.mobile ? 320 : 260;
+    const minBaseStep = options.mobile ? 110 : 90;
+    const sequenceLength = randomInt(options.mobile ? 6 : 5, options.mobile ? 10 : 8);
 
-    const totalScroll = randomInt(options.mobile ? 650 : 500, options.mobile ? 1300 : 1000);
-    const steps = randomInt(options.mobile ? 4 : 3, options.mobile ? 7 : 6);
-    const scrollPerStep = Math.floor(totalScroll / steps);
+    dismissBlockingUi();
+    await sleep(randomInt(options.mobile ? 1400 : 900, options.mobile ? 2400 : 1700));
 
-    for (let index = 0; index < steps; index += 1) {
-      window.scrollBy({
-        top: scrollPerStep + randomInt(-60, 70),
-        behavior: 'smooth'
-      });
-      await sleep(randomInt(options.mobile ? 900 : 800, options.mobile ? 1800 : 1500));
+    for (let index = 0; index < sequenceLength; index += 1) {
+      let direction = 1;
+      if (index > 1 && Math.random() < 0.35) {
+        direction = -1;
+      }
+
+      if (index > 3 && Math.random() < 0.2) {
+        direction = 1;
+      }
+
+      scrollPlan.push(direction * randomInt(minBaseStep, maxBaseStep));
     }
 
-    if (options.mobile) {
-      const resultAnchors = Array.from(document.querySelectorAll('#b_results a[href], main a[href], article a[href]'))
-        .filter((element) => /^https?:/i.test(element.href || ''))
-        .slice(0, 2);
+    for (const delta of scrollPlan) {
+      window.scrollBy({
+        top: delta,
+        behavior: 'smooth'
+      });
 
-      for (const anchor of resultAnchors) {
+      await sleep(randomInt(options.mobile ? 550 : 500, options.mobile ? 1200 : 1000));
+
+      if (Math.random() < 0.45) {
+        window.scrollBy({
+          top: randomInt(-35, 35),
+          behavior: 'auto'
+        });
+      }
+
+      if (Math.random() < 0.5) {
+        dismissBlockingUi();
+      }
+
+      await sleep(randomInt(options.mobile ? 300 : 250, options.mobile ? 850 : 700));
+    }
+
+    const resultAnchors = Array.from(document.querySelectorAll('#b_results a[href], main a[href], article a[href]'))
+      .filter((element) => /^https?:/i.test(element.href || ''))
+      .slice(0, options.mobile ? 4 : 6);
+
+    if (resultAnchors.length > 0) {
+      const visitCount = Math.min(resultAnchors.length, randomInt(1, options.mobile ? 3 : 4));
+      for (let index = 0; index < visitCount; index += 1) {
+        const anchor = resultAnchors[index];
         anchor.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await sleep(randomInt(700, 1400));
+        await sleep(randomInt(options.mobile ? 700 : 600, options.mobile ? 1500 : 1300));
+
+        if (Math.random() < 0.55) {
+          window.scrollBy({
+            top: randomInt(-80, 120),
+            behavior: 'smooth'
+          });
+          await sleep(randomInt(350, 900));
+        }
+
+        if (Math.random() < 0.4) {
+          dismissBlockingUi();
+        }
       }
     }
 
-    if (Math.random() > 0.5) {
-      window.scrollBy({ top: -randomInt(100, 280), behavior: 'smooth' });
-      await sleep(randomInt(900, 1800));
+    if (Math.random() > 0.3) {
+      window.scrollBy({
+        top: -randomInt(options.mobile ? 120 : 90, options.mobile ? 260 : 220),
+        behavior: 'smooth'
+      });
+      await sleep(randomInt(options.mobile ? 750 : 650, options.mobile ? 1500 : 1200));
     }
 
-    return { success: true, mobile: Boolean(options.mobile), steps };
+    dismissBlockingUi();
+    return {
+      success: true,
+      mobile: Boolean(options.mobile),
+      steps: scrollPlan.length
+    };
   }
 
   async function scrapePoints() {
@@ -501,27 +547,148 @@
     return rect.width > 24 && rect.height > 24;
   }
 
-  function dismissBlockingUi() {
-    const selectors = [
-      '[class*="overlay"]',
-      '[class*="modal"]',
-      '.b_overlay',
-      '[data-dismiss]',
-      '[aria-label*="close" i]',
-      '[aria-label*="dismiss" i]'
-    ];
+  function isInteractableElement(element) {
+    if (!element) return false;
 
-    selectors.forEach((selector) => {
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+
+    const style = window.getComputedStyle(element);
+    if (!style) return false;
+    if (style.display === 'none' || style.visibility === 'hidden' || style.pointerEvents === 'none') {
+      return false;
+    }
+
+    return true;
+  }
+
+  function getElementText(element) {
+    return [
+      element?.getAttribute?.('aria-label'),
+      element?.getAttribute?.('title'),
+      element?.getAttribute?.('data-testid'),
+      element?.textContent
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function isLargeBlockingContainer(element) {
+    if (!element) return false;
+
+    const rect = element.getBoundingClientRect();
+    if (rect.width < 180 || rect.height < 80) return false;
+
+    const style = window.getComputedStyle(element);
+    const text = getElementText(element);
+    const fixedLike = /fixed|sticky|absolute/i.test(style.position || '');
+    const highZ = parseInt(style.zIndex || '0', 10);
+    const overlayLike = fixedLike && (highZ >= 20 || rect.width >= window.innerWidth * 0.6 || rect.height >= window.innerHeight * 0.25);
+
+    return overlayLike || BLOCKING_TEXT_RE.test(text);
+  }
+
+  function hideBlockingElement(element) {
+    if (!element) return false;
+
+    try {
+      element.setAttribute('data-bra-dismissed', 'true');
+      element.style.setProperty('display', 'none', 'important');
+      element.style.setProperty('visibility', 'hidden', 'important');
+      element.style.setProperty('pointer-events', 'none', 'important');
+      element.style.setProperty('opacity', '0', 'important');
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function dismissBlockingUi() {
+    const closeSelectors = [
+      '[data-dismiss]',
+      '[data-action*="close" i]',
+      '[aria-label*="close" i]',
+      '[aria-label*="dismiss" i]',
+      '[title*="close" i]',
+      '[title*="dismiss" i]',
+      'button[aria-label="Close"]',
+      'button[aria-label="Dismiss"]',
+      'button[id*="close" i]',
+      'button[class*="close" i]',
+      '[role="button"][class*="close" i]'
+    ];
+    const containerSelectors = [
+      '[role="dialog"]',
+      '[aria-modal="true"]',
+      '[class*="overlay" i]',
+      '[class*="modal" i]',
+      '[class*="popup" i]',
+      '[class*="backdrop" i]',
+      '[class*="cookie" i]',
+      '[class*="consent" i]',
+      '.b_overlay'
+    ];
+    const clicked = new Set();
+    const hidden = new Set();
+
+    closeSelectors.forEach((selector) => {
       document.querySelectorAll(selector).forEach((element) => {
+        if (!isInteractableElement(element)) return;
+        const label = getElementText(element);
+        if (label && !DISMISS_TEXT_RE.test(label) && !/close|dismiss/i.test(selector)) return;
+
         try {
-          if (element.matches('button, [role="button"], [data-dismiss], [aria-label*="close" i], [aria-label*="dismiss" i]')) {
-            element.click();
-          } else {
-            element.style.display = 'none';
-          }
+          element.click();
+          clicked.add(element);
         } catch (error) {}
       });
     });
+
+    const clickableElements = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+    clickableElements.forEach((element) => {
+      if (!isInteractableElement(element)) return;
+      const label = getElementText(element);
+      if (!label || !DISMISS_TEXT_RE.test(label)) return;
+      if (!element.closest('[role="dialog"], [aria-modal="true"], [class*="overlay" i], [class*="modal" i], [class*="popup" i], [class*="cookie" i], [class*="consent" i]')) {
+        return;
+      }
+
+      try {
+        element.click();
+        clicked.add(element);
+      } catch (error) {}
+    });
+
+    containerSelectors.forEach((selector) => {
+      document.querySelectorAll(selector).forEach((element) => {
+        if (!isLargeBlockingContainer(element)) return;
+        if (hideBlockingElement(element)) {
+          hidden.add(element);
+        }
+      });
+    });
+
+    Array.from(document.querySelectorAll('div, aside, section')).forEach((element) => {
+      if (!isLargeBlockingContainer(element)) return;
+      if (hideBlockingElement(element)) {
+        hidden.add(element);
+      }
+    });
+
+    [document.documentElement, document.body].forEach((element) => {
+      if (!element) return;
+      try {
+        element.style.removeProperty('overflow');
+        element.style.removeProperty('position');
+      } catch (error) {}
+    });
+
+    return {
+      clicked: clicked.size,
+      hidden: hidden.size
+    };
   }
 
   async function runTaskPageInteraction(options = {}) {
@@ -553,6 +720,7 @@
         await sleep(randomInt(350, 650));
         element.click();
         clicked.push(label.substring(0, 80));
+        dismissBlockingUi();
         await sleep(randomInt(1200, 2000));
         if (clicked.length >= 2) break;
       } catch (error) {}
@@ -619,6 +787,7 @@
     applyMobileProfile,
     collectDashboardTaskLinks,
     collectEnvironmentSnapshot,
+    dismissBlockingUi,
     enhancedSearchInteraction,
     findSearchInput,
     getEnvironmentSnapshot: collectEnvironmentSnapshot,
