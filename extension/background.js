@@ -1,3 +1,4 @@
+import { fetchPendingDailyTaskUrls } from './daily_tasks_new.js';
 import { getAllKeywords } from './keywords-data.js';
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -21,6 +22,9 @@ const TAB_LOAD_TIMEOUT_MS = 45000;
 const SEARCH_READY_DELAY_MS = [900, 1700];
 const SEARCH_SETTLE_DELAY_MS = [1800, 3200];
 const INTERACTION_SETTLE_DELAY_MS = [2200, 4200];
+const TASK_READY_DELAY_MS = [1200, 2200];
+const TASK_DWELL_DELAY_MS = [5000, 10000];
+const TASK_COOLDOWN_DELAY_MS = [1500, 3000];
 const SAFE_DELAY_SECONDS = Object.freeze({
   min: 20,
   max: 40
@@ -28,9 +32,8 @@ const SAFE_DELAY_SECONDS = Object.freeze({
 const USER_STOPPED_ERROR = 'USER_STOPPED';
 
 const STATUS_MESSAGES = {
-  daily_tasks: 'Daily task automation is not available until Phase 3.',
-  check_points: 'Points verification is not available in the keep-alive phase.',
-  reset_page: 'Page reset is not available in the keep-alive phase.'
+  check_points: 'Points verification is not available in the API task phase.',
+  reset_page: 'Page reset is not available in the API task phase.'
 };
 
 function createSearchState() {
@@ -358,6 +361,14 @@ function syncSearchState(branchKey, label) {
   broadcastState();
 }
 
+function syncTaskState() {
+  state.progress = `Tasks ${state.tasks.completed}/${state.tasks.planned}`;
+  state.percent = state.tasks.planned > 0
+    ? Math.min(100, Math.floor((state.tasks.completed / state.tasks.planned) * 100))
+    : 0;
+  broadcastState();
+}
+
 async function runSingleSearch(keyword, isMobile) {
   let tab = null;
 
@@ -389,9 +400,7 @@ async function runSingleSearch(keyword, isMobile) {
     }
 
     await waitWithStop(randomInt(...INTERACTION_SETTLE_DELAY_MS));
-    return {
-      success: true
-    };
+    return { success: true };
   } finally {
     if (tab?.id) {
       await closeTab(tab.id);
@@ -464,6 +473,109 @@ async function runSearchAutomation(count, isMobile) {
   syncSearchState(branchKey, label);
 }
 
+async function runTaskVisit(url) {
+  let tab = null;
+
+  try {
+    tab = await chrome.tabs.create({
+      url,
+      active: false
+    });
+
+    await waitForTabLoad(tab.id);
+    await waitWithStop(randomInt(...TASK_READY_DELAY_MS));
+
+    const taskResult = await callAutomationMethod(tab.id, 'runTaskPageInteraction', [{ mobile: false }]);
+    if (Array.isArray(taskResult?.clicked) && taskResult.clicked.length > 0) {
+      log(`[Tasks] Clicked ${taskResult.clicked.length} action(s) on task page.`);
+    }
+
+    const dwellMs = randomInt(...TASK_DWELL_DELAY_MS);
+    log(`[Tasks] Waiting ${Math.round(dwellMs / 1000)}s on task page.`);
+    await waitWithStop(dwellMs);
+  } finally {
+    if (tab?.id) {
+      await closeTab(tab.id);
+    }
+  }
+}
+
+async function runDailyTasksAutomation() {
+  resetRuntimeState();
+  state.status = 'running';
+  state.progress = 'Tasks';
+  state.percent = 0;
+  broadcastState();
+  startKeepAlive();
+
+  try {
+    const taskUrls = await fetchPendingDailyTaskUrls();
+    state.tasks.planned = taskUrls.length;
+    state.tasks.pending = taskUrls.length;
+    state.tasks.lastSource = 'api';
+    state.tasks.lastOutcome = taskUrls.length > 0 ? 'Pending tasks loaded from Rewards API' : 'No pending daily tasks';
+    syncTaskState();
+
+    if (taskUrls.length === 0) {
+      state.status = 'done';
+      state.progress = 'Completed';
+      state.percent = 100;
+      state.summary.verificationBadge = 'API Tasks';
+      log('[Tasks] Rewards API returned no pending daily tasks.');
+      broadcastState();
+      return;
+    }
+
+    log(`[Tasks] Rewards API returned ${taskUrls.length} pending task URL(s).`);
+
+    for (let index = 0; index < taskUrls.length; index += 1) {
+      assertNotStopped();
+
+      const url = taskUrls[index];
+      state.tasks.lastOutcome = `Opening task ${index + 1}/${taskUrls.length}`;
+      syncTaskState();
+      log(`[Tasks] Opening ${index + 1}/${taskUrls.length}: ${url}`);
+
+      await runTaskVisit(url);
+
+      state.tasks.executed += 1;
+      state.tasks.completed += 1;
+      state.tasks.pending = Math.max(0, taskUrls.length - state.tasks.executed);
+      state.tasks.lastOutcome = `Visited task ${index + 1}/${taskUrls.length}`;
+      syncTaskState();
+
+      if (index < taskUrls.length - 1) {
+        await waitWithStop(randomInt(...TASK_COOLDOWN_DELAY_MS));
+      }
+    }
+
+    state.status = 'done';
+    state.progress = 'Completed';
+    state.percent = 100;
+    state.summary.verificationBadge = 'API Tasks';
+    log('[Tasks] Daily tasks automation completed.', 'success');
+    broadcastState();
+  } catch (error) {
+    if (error.message === USER_STOPPED_ERROR) {
+      state.status = 'stopped';
+      state.progress = 'Stopped';
+      state.percent = 0;
+      log('[Tasks] Stopped by user', 'warning');
+      broadcastState();
+      return;
+    }
+
+    state.status = 'error';
+    state.progress = 'Error';
+    state.percent = 0;
+    log(`[Tasks] ${error.message}`, 'error');
+    broadcastState();
+  } finally {
+    await setMobileMode(false);
+    stopKeepAlive();
+  }
+}
+
 async function runStartAutomation() {
   const config = await getConfig();
 
@@ -525,10 +637,29 @@ function startSearchRun() {
     });
 }
 
+function startDailyTasksRun() {
+  if (activeRunPromise) {
+    log('[Tasks] Another automation session is already active.', 'warning');
+    return;
+  }
+
+  activeRunPromise = runDailyTasksAutomation()
+    .catch((error) => {
+      log(`[Tasks] ${error.message}`, 'error');
+    })
+    .finally(() => {
+      activeRunPromise = null;
+    });
+}
+
 async function handleCommand(command) {
   switch (command) {
     case 'start_search':
       startSearchRun();
+      return;
+
+    case 'daily_tasks':
+      startDailyTasksRun();
       return;
 
     case 'stop':
