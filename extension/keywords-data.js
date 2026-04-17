@@ -4,7 +4,7 @@
 // =============================================
 
 // ─── DYNAMIC KEYWORDS (tự thay đổi theo ngày/tháng/mùa) ─────
-self.getDynamicKeywords = function () {
+export function getDynamicKeywords() {
   const now    = new Date();
   const day    = now.getDate();
   const month  = now.getMonth() + 1; // 1–12
@@ -156,7 +156,7 @@ self.getDynamicKeywords = function () {
 };
 
 // ─── STATIC KEYWORD LIST ─────────────────────────────────────
-self.KEYWORD_LIST = [
+export const KEYWORD_LIST = [
 
   // ══════════════════════════════════════════
   // TIN TỨC & THỜI SỰ (50)
@@ -661,13 +661,13 @@ self.KEYWORD_LIST = [
 ];
 
 // ─── COMBINED GETTER (dùng cái này trong background.js) ──────
-self.getAllKeywords = function () {
-  const dynamic  = self.getDynamicKeywords();
-  const combined = [...self.KEYWORD_LIST, ...dynamic];
+export function getAllKeywords() {
+  const dynamic  = getDynamicKeywords();
+  const combined = [...KEYWORD_LIST, ...dynamic];
   // Shuffle để không lặp pattern
   for (let i = combined.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [combined[i], combined[j]] = [combined[j], combined[i]];
   }
   return combined;
-};
+}
