@@ -1,4 +1,4 @@
-export const REWARDS_API_URL = 'https://rewards.bing.com/api/getuserinfo?type=1';
+export const REWARDS_API_URL = 'https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest';
 
 const TASK_URL_BLACKLIST = [
   'referandearn',
@@ -129,7 +129,10 @@ export function scanUncompletedTasks(dashboard) {
 export async function fetchPendingDailyTaskUrls(fetchImpl = fetch) {
   const response = await fetchImpl(REWARDS_API_URL, {
     cache: 'no-store',
-    credentials: 'include'
+    credentials: 'include',
+    headers: {
+      'X-Requested-With': 'XMLHttpRequest'
+    }
   });
 
   if (!response.ok) {
