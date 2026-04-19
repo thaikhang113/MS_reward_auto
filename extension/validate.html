@@ -181,12 +181,9 @@
       // 6. Test keywords
       log('6️⃣ Testing keywords-data.js...');
       try {
-        const r = await fetch(basePath + 'keywords-data.js');
-        const text = await r.text();
-        new Function(text);
-        // Check keyword count
-        const matches = text.match(/'[^']+'/g);
-        log('   ✅ keywords-data.js syntax OK (~' + (matches ? matches.length : '?') + ' keywords)', 'ok');
+        const mod = await import(basePath + 'keywords-data.js?ts=' + Date.now());
+        const fallbackCount = Array.isArray(mod.KEYWORD_LIST) ? mod.KEYWORD_LIST.length : '?';
+        log('   ✅ keywords-data.js module OK (~' + fallbackCount + ' fallback keywords)', 'ok');
       } catch (e) {
         log('   ❌ keywords-data.js SYNTAX ERROR: ' + e.message, 'err');
       }
