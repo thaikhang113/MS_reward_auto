@@ -30,6 +30,31 @@ export function hasSupportedHost(hostname) {
     || /(^|\.)microsoft\.com$/i.test(hostname);
 }
 
+function buildRewardsFilters(parsedUrl) {
+  if (parsedUrl.searchParams.has('filters')) {
+    return parsedUrl.searchParams.get('filters');
+  }
+
+  const filterTokens = [];
+  const tokenSpecs = [
+    ['wqoskey', 'WQOskey'],
+    ['wqid', 'WQId'],
+    ['btroid', 'BTROID'],
+    ['btroec', 'BTROEC'],
+    ['btromc', 'BTROMC']
+  ];
+
+  tokenSpecs.forEach(([paramKey, filterKey]) => {
+    const rawValue = parsedUrl.searchParams.get(paramKey);
+    if (!rawValue) return;
+
+    const safeValue = String(rawValue).replace(/"/g, '\\"');
+    filterTokens.push(`${filterKey}:"${safeValue}"`);
+  });
+
+  return filterTokens.length ? filterTokens.join(' ') : null;
+}
+
 export function normalizeTaskUrl(rawUrl) {
   if (typeof rawUrl !== 'string') return null;
 
@@ -53,6 +78,18 @@ export function normalizeTaskUrl(rawUrl) {
     }
 
     parsedUrl.searchParams.delete('rnoreward');
+
+    if (
+      /(^|\.)bing\.com$/i.test(hostname)
+      && /\/(search|news)/i.test(path)
+      && !parsedUrl.searchParams.has('filters')
+    ) {
+      const filtersValue = buildRewardsFilters(parsedUrl);
+      if (filtersValue) {
+        parsedUrl.searchParams.set('filters', filtersValue);
+      }
+    }
+
     parsedUrl.hash = '';
     return parsedUrl.toString();
   } catch (error) {

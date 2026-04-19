@@ -1278,11 +1278,12 @@ async function runTaskVisit(url) {
   try {
     tab = await chrome.tabs.create({
       url,
-      active: false
+      active: true
     });
 
     await waitForTabLoad(tab.id);
-    await waitWithStop(randomInt(...TASK_READY_DELAY_MS));
+    // Human-like tab focus: doi 2-3 giay sau khi load xong roi moi bat dau inject va tuong tac.
+    await waitWithStop(randomInt(2000, 3000));
 
     const taskResult = await callAutomationMethod(tab.id, 'runTaskPageInteraction', [{ mobile: false }]);
     if (!taskResult?.success) {

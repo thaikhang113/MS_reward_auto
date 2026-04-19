@@ -1060,45 +1060,6 @@
       applyMobileProfile();
     }
 
-    dismissBlockingUi();
-    await sleep(randomInt(700, 1200));
-
-    const previewTargets = dedupeElements([
-      ...findTaskStartButtons(),
-      ...findTaskAnswerOptions(),
-      ...collectTaskActionCandidates()
-    ])
-      .filter((element) => isVisibleElement(element))
-      .sort(() => Math.random() - 0.5)
-      .slice(0, randomInt(2, 4));
-
-    if (previewTargets.length > 0) {
-      for (const target of previewTargets) {
-        // Anti-ban: cuộn qua vài điểm trên trang rồi dừng 1-2 giây như người thật đang đọc nội dung task.
-        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await sleep(randomInt(1000, 2000));
-
-        if (Math.random() < 0.7) {
-          window.scrollBy({
-            top: randomInt(-90, 160),
-            behavior: 'smooth'
-          });
-          await sleep(randomInt(350, 700));
-        }
-
-        dismissBlockingUi();
-      }
-    } else {
-      // Anti-ban: nếu chưa thấy nút rõ ràng thì vẫn lướt nhẹ để tránh click ngay lập tức khi vừa load trang.
-      for (let index = 0; index < 2; index += 1) {
-        window.scrollBy({
-          top: randomInt(120, 260) * (index === 0 ? 1 : -1),
-          behavior: 'smooth'
-        });
-        await sleep(randomInt(900, 1500));
-      }
-    }
-
     const result = {
       success: true,
       mode: 'standard',
@@ -1107,6 +1068,146 @@
       started: false,
       completed: false
     };
+    const supportedInternalHostRe = /(^|\.)bing\.com$|(^|\.)msn\.com$|(^|\.)microsoft\.com$/i;
+    const clampCoordinate = (value, min, max) => Math.min(Math.max(value, min), max);
+    const getViewportSize = () => ({
+      width: Math.max(320, window.innerWidth || document.documentElement.clientWidth || 1280),
+      height: Math.max(320, window.innerHeight || document.documentElement.clientHeight || 720)
+    });
+    const dispatchMouseMove = (clientX, clientY) => {
+      const target = document.elementFromPoint(clientX, clientY) || document.body || document.documentElement;
+      const eventInit = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX,
+        clientY
+      };
+
+      document.dispatchEvent(new MouseEvent('mousemove', eventInit));
+      target.dispatchEvent(new MouseEvent('mousemove', eventInit));
+      target.dispatchEvent(new MouseEvent('mouseover', eventInit));
+    };
+    const performHumanMousePass = async (steps = randomInt(5, 9)) => {
+      const viewport = getViewportSize();
+
+      for (let index = 0; index < steps; index += 1) {
+        const clientX = clampCoordinate(randomInt(24, viewport.width - 24), 0, viewport.width - 1);
+        const clientY = clampCoordinate(randomInt(24, viewport.height - 24), 0, viewport.height - 1);
+        dispatchMouseMove(clientX, clientY);
+        await sleep(randomInt(120, 280));
+      }
+    };
+    const performHumanScrollPass = async () => {
+      const downSteps = randomInt(3, 5);
+
+      for (let index = 0; index < downSteps; index += 1) {
+        window.scrollBy({
+          top: randomInt(140, 320),
+          behavior: 'smooth'
+        });
+        await sleep(randomInt(700, 1300));
+        dismissBlockingUi();
+      }
+
+      window.scrollBy({
+        top: -randomInt(90, 220),
+        behavior: 'smooth'
+      });
+      await sleep(randomInt(900, 1500));
+      dismissBlockingUi();
+    };
+    const isInternalInteractionTarget = (element) => {
+      if (!element || !isVisibleElement(element) || !isInteractableElement(element)) {
+        return false;
+      }
+
+      if (element.closest('header, nav, footer')) {
+        return false;
+      }
+
+      if (element.tagName === 'A') {
+        const href = element.href || '';
+        if (!/^https?:/i.test(href)) return false;
+
+        try {
+          const parsedUrl = new URL(href);
+          return supportedInternalHostRe.test(parsedUrl.hostname);
+        } catch (error) {
+          return false;
+        }
+      }
+
+      return true;
+    };
+    const clickNewsStory = async () => {
+      const selectors = [
+        'h3 a[href]',
+        'article a[href]',
+        'a[href][class*="title" i]',
+        'a[href][class*="headline" i]',
+        '[data-testid*="title" i] a[href]',
+        'main a[href]'
+      ];
+      const candidates = dedupeElements(
+        selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      )
+        .filter((element) => isInternalInteractionTarget(element))
+        .sort(() => Math.random() - 0.5);
+
+      const choice = candidates[0];
+      if (!choice) {
+        return false;
+      }
+
+      const label = getElementText(choice) || choice.href || 'news_item';
+      const clicked = await clickTaskElement(choice);
+      if (!clicked) {
+        return false;
+      }
+
+      result.clicked.push(label.substring(0, 80));
+      await sleep(randomInt(1800, 3200));
+      return true;
+    };
+    const clickRandomInternalAction = async () => {
+      const candidates = dedupeElements([
+        ...Array.from(document.querySelectorAll('a[href], button, [role="button"]')),
+        ...collectTaskActionCandidates()
+      ])
+        .filter((element) => isInternalInteractionTarget(element))
+        .sort(() => Math.random() - 0.5);
+      const interactionLimit = randomInt(1, 2);
+      let interactions = 0;
+
+      for (const candidate of candidates) {
+        const label = getElementText(candidate);
+        if (!label && candidate.tagName !== 'A') continue;
+
+        const clicked = await clickTaskElement(candidate);
+        if (!clicked) continue;
+
+        interactions += 1;
+        result.clicked.push((label || candidate.href || 'internal_action').substring(0, 80));
+        dismissBlockingUi();
+        await sleep(randomInt(1300, 2400));
+
+        if (interactions >= interactionLimit) {
+          return true;
+        }
+      }
+
+      return interactions > 0;
+    };
+
+    dismissBlockingUi();
+    await sleep(randomInt(700, 1200));
+
+    // Anti-detection: them cac dau vet chuot nho de trang co nhieu su kien nhu mot phien doc that.
+    await performHumanMousePass();
+    // Anti-detection: cuon xuong cham roi keo len mot chut nhu nguoi dang doc noi dung.
+    await performHumanScrollPass();
+    await performHumanMousePass(randomInt(4, 7));
 
     const detection = detectTaskInteractionMode();
     result.mode = detection.mode;
@@ -1124,8 +1225,22 @@
       return result;
     }
 
-    await performStandardTaskInteraction(result);
-    result.completed = isTaskCompleted();
+    if (/news/i.test(window.location.href)) {
+      result.mode = 'news';
+      const openedNews = await clickNewsStory();
+      if (!openedNews) {
+        await clickRandomInternalAction();
+      }
+      result.completed = openedNews || isTaskCompleted();
+      return result;
+    }
+
+    const interacted = await clickRandomInternalAction();
+    if (!interacted) {
+      await performStandardTaskInteraction(result);
+    }
+
+    result.completed = interacted || isTaskCompleted();
     return result;
   }
 
