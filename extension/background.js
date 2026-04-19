@@ -1,4 +1,4 @@
-import { fetchPendingDailyTaskUrls } from './daily_tasks_new.js';
+import { fetchPendingDailyTaskUrls, getTaskDedupKey, normalizeTaskUrl } from './daily_tasks_new.js';
 import { getAllKeywords } from './keywords-data.js';
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -20,7 +20,9 @@ const REWARDS_API_URL = 'https://rewards.bing.com/api/getuserinfo?type=1&X-Reque
 const MOBILE_RULESET_ID = 'mobile_ua_rules';
 const AUTOMATION_WORLD = 'MAIN';
 const FETCH_TIMEOUT_MS = 15000;
-const KEEP_ALIVE_INTERVAL_MS = 15000;
+const KEEP_ALIVE_HEARTBEAT_MS = 20000;
+const ACTIVE_SESSION_ALARM_NAME = 'mv3-active-session-watchdog';
+const ACTIVE_SESSION_ALARM_PERIOD_MINUTES = 0.5;
 const WAIT_SLICE_MS = 1000;
 const TAB_LOAD_TIMEOUT_MS = 45000;
 const SEARCH_READY_DELAY_MS = [900, 1700];
@@ -28,16 +30,26 @@ const SEARCH_SETTLE_DELAY_MS = [1800, 3200];
 const INTERACTION_SETTLE_DELAY_MS = [2200, 4200];
 const SEARCH_VERIFY_ATTEMPTS = 3;
 const SEARCH_VERIFY_DELAY_MS = 5000;
+const SEARCH_RETRY_BACKOFF_MS = [4000, 9000];
 const TASK_READY_DELAY_MS = [1200, 2200];
 const TASK_DWELL_DELAY_MS = [5000, 10000];
 const TASK_COOLDOWN_DELAY_MS = [1500, 3000];
+const TASK_RETRY_BACKOFF_MS = [5000, 11000];
+const TASK_VERIFY_SETTLE_DELAY_MS = [2500, 4500];
 const SUCCESS_BADGE = 'API Verified';
 const FALLBACK_BADGE = 'Fallback';
+const MAX_RUNTIME_LOGS = 200;
+const MAX_RECENT_KEYWORDS = 24;
+const RUNTIME_STATE_KEY = 'runtimeState';
+const RUNTIME_LOGS_KEY = 'runtimeLogs';
+const RUNTIME_RECENT_KEYWORDS_KEY = 'runtimeRecentKeywords';
+const RUNTIME_SESSION_KEY = 'runtimeSession';
 const SAFE_DELAY_SECONDS = Object.freeze({
   min: 20,
   max: 40
 });
 const USER_STOPPED_ERROR = 'USER_STOPPED';
+const RECOVERED_STATE_PROGRESS = 'Recovered after worker restart';
 const MOBILE_COUNTER_RE = /mobile/i;
 const PC_COUNTER_RE = /pc|desktop/i;
 const SEARCH_COUNTER_RE = /search/i;
@@ -110,23 +122,175 @@ function createInitialState() {
   };
 }
 
+function createInitialRuntimeSession() {
+  return {
+    activeCommand: null,
+    startedAt: null,
+    heartbeatAt: null,
+    heartbeatSource: null,
+    bootstrapLogged: false
+  };
+}
+
 let state = createInitialState();
 let logs = [];
 let keywordCache = [];
 let recentKeywords = [];
+let runtimeSession = createInitialRuntimeSession();
 let keepAliveTimer = null;
 let activeRunPromise = null;
+let initPromise = null;
+let persistInFlight = null;
+let persistDirty = false;
 
 function getPublicState() {
   return JSON.parse(JSON.stringify(state));
 }
 
-function broadcast(message) {
-  chrome.runtime.sendMessage(message).catch(() => {});
+function getRuntimeStorageArea() {
+  return chrome.storage.session || chrome.storage.local;
+}
+
+function mergePersistedState(savedState) {
+  const initialState = createInitialState();
+  const candidate = savedState && typeof savedState === 'object' ? savedState : {};
+
+  return {
+    ...initialState,
+    ...candidate,
+    wave: {
+      ...initialState.wave,
+      ...(candidate.wave || {})
+    },
+    points: {
+      ...initialState.points,
+      ...(candidate.points || {}),
+      history: Array.isArray(candidate.points?.history)
+        ? candidate.points.history.slice(0, 100)
+        : []
+    },
+    mobile: {
+      ...createSearchState(),
+      ...(candidate.mobile || {})
+    },
+    pc: {
+      ...createSearchState(),
+      ...(candidate.pc || {})
+    },
+    tasks: {
+      ...initialState.tasks,
+      ...(candidate.tasks || {})
+    },
+    verification: {
+      ...initialState.verification,
+      ...(candidate.verification || {})
+    },
+    summary: {
+      ...initialState.summary,
+      ...(candidate.summary || {})
+    }
+  };
+}
+
+function normalizeLogs(savedLogs) {
+  return Array.isArray(savedLogs)
+    ? savedLogs
+      .filter((entry) => entry && typeof entry === 'object')
+      .slice(0, MAX_RUNTIME_LOGS)
+    : [];
+}
+
+function normalizeRecentKeywords(savedKeywords) {
+  return Array.isArray(savedKeywords)
+    ? savedKeywords
+      .filter((keyword) => typeof keyword === 'string' && keyword.trim())
+      .slice(-MAX_RECENT_KEYWORDS)
+    : [];
+}
+
+function normalizeRuntimeSession(savedSession) {
+  return {
+    ...createInitialRuntimeSession(),
+    ...(savedSession && typeof savedSession === 'object' ? savedSession : {})
+  };
+}
+
+function buildRuntimeSnapshot() {
+  return {
+    [RUNTIME_STATE_KEY]: getPublicState(),
+    [RUNTIME_LOGS_KEY]: logs.slice(0, MAX_RUNTIME_LOGS),
+    [RUNTIME_RECENT_KEYWORDS_KEY]: recentKeywords.slice(-MAX_RECENT_KEYWORDS),
+    [RUNTIME_SESSION_KEY]: { ...runtimeSession }
+  };
+}
+
+function scheduleRuntimePersist() {
+  persistDirty = true;
+
+  if (persistInFlight) {
+    return persistInFlight;
+  }
+
+  persistInFlight = (async () => {
+    const runtimeStorage = getRuntimeStorageArea();
+
+    while (persistDirty) {
+      persistDirty = false;
+      await runtimeStorage.set(buildRuntimeSnapshot());
+    }
+  })()
+    .catch((error) => {
+      console.warn('[Runtime] Persist failed:', error);
+    })
+    .finally(() => {
+      persistInFlight = null;
+    });
+
+  return persistInFlight;
+}
+
+async function persistRuntimeSession() {
+  try {
+    await getRuntimeStorageArea().set({
+      [RUNTIME_SESSION_KEY]: { ...runtimeSession }
+    });
+  } catch (error) {
+    console.warn('[Runtime] Session persist failed:', error);
+  }
+}
+
+async function disableMobileRulesSilently() {
+  try {
+    await chrome.declarativeNetRequest.updateEnabledRulesets({
+      disableRulesetIds: [MOBILE_RULESET_ID]
+    });
+  } catch (error) {}
+
+  state.mobileRuleEnabled = false;
+  state.mobile.enabled = false;
+}
+
+function isIgnorableBroadcastError(error) {
+  const message = String(error?.message || error || '');
+
+  return message.includes('Could not establish connection')
+    || message.includes('Receiving end does not exist')
+    || message.includes('The message port closed before a response was received');
+}
+
+async function broadcast(message) {
+  try {
+    await chrome.runtime.sendMessage(message);
+  } catch (error) {
+    if (!isIgnorableBroadcastError(error)) {
+      console.debug('[Broadcast] Message dropped:', error);
+    }
+  }
 }
 
 function broadcastState() {
-  broadcast({
+  void scheduleRuntimePersist();
+  void broadcast({
     action: 'state_update',
     data: getPublicState()
   });
@@ -140,11 +304,12 @@ function log(text, type = 'info') {
   };
 
   logs.unshift(entry);
-  if (logs.length > 200) {
-    logs.length = 200;
+  if (logs.length > MAX_RUNTIME_LOGS) {
+    logs.length = MAX_RUNTIME_LOGS;
   }
 
-  broadcast({ action: 'log', data: entry });
+  void scheduleRuntimePersist();
+  void broadcast({ action: 'log', data: entry });
 }
 
 function sleep(ms) {
@@ -180,6 +345,174 @@ function cloneCounter(counter) {
         score: counter.score
       }
     : null;
+}
+
+function buildRetryBackoffDelayMs(range, retryIndex) {
+  const [minDelay, maxDelay] = range;
+  const multiplier = 1 + (Math.max(0, retryIndex) * 0.6);
+  return randomInt(
+    Math.round(minDelay * multiplier),
+    Math.round(maxDelay * multiplier)
+  );
+}
+
+function hasPendingTaskUrl(pendingUrls, url) {
+  const taskKey = getTaskDedupKey(url);
+  return pendingUrls.some((pendingUrl) => getTaskDedupKey(pendingUrl) === taskKey);
+}
+
+async function fetchPendingTaskSnapshot() {
+  const mergedTasks = new Map();
+  let apiError = null;
+  let dashboardError = null;
+  let apiCount = 0;
+  let dashboardCount = 0;
+  let dashboardVisitedCards = 0;
+  let dashboardTab = null;
+
+  try {
+    const apiUrls = await fetchPendingDailyTaskUrls();
+    apiCount = apiUrls.length;
+
+    for (const rawUrl of apiUrls) {
+      const normalizedUrl = normalizeTaskUrl(rawUrl);
+      if (!normalizedUrl) continue;
+      mergedTasks.set(getTaskDedupKey(normalizedUrl), normalizedUrl);
+    }
+  } catch (error) {
+    apiError = error;
+  }
+
+  try {
+    dashboardTab = await chrome.tabs.create({
+      url: new URL('/earn', REWARDS_HOME_URL).toString(),
+      active: false
+    });
+
+    await waitForTabLoad(dashboardTab.id);
+    await waitWithStop(randomInt(1800, 2600));
+
+    const dashboardResult = await callAutomationMethod(dashboardTab.id, 'collectDashboardTaskLinks', [{ mobile: false }]);
+    if (!Array.isArray(dashboardResult?.tasks)) {
+      throw new Error('collectDashboardTaskLinks returned an invalid payload');
+    }
+
+    dashboardCount = dashboardResult.tasks.length;
+    dashboardVisitedCards = Number(dashboardResult.cardsVisited || 0);
+
+    for (const task of dashboardResult.tasks) {
+      const normalizedUrl = normalizeTaskUrl(task?.url || task);
+      if (!normalizedUrl) continue;
+      mergedTasks.set(getTaskDedupKey(normalizedUrl), normalizedUrl);
+    }
+  } catch (error) {
+    dashboardError = error;
+  } finally {
+    if (dashboardTab?.id) {
+      await closeTab(dashboardTab.id);
+    }
+  }
+
+  if (!mergedTasks.size && apiError && dashboardError) {
+    throw new Error(`Unable to load dashboard tasks: ${dashboardError.message}; API fallback failed: ${apiError.message}`);
+  }
+
+  const pendingUrls = [...mergedTasks.values()];
+  return {
+    pendingUrls,
+    pendingKeys: new Set(pendingUrls.map((url) => getTaskDedupKey(url))),
+    sources: {
+      apiCount,
+      dashboardCount,
+      dashboardVisitedCards,
+      apiError: apiError?.message || null,
+      dashboardError: dashboardError?.message || null
+    }
+  };
+}
+
+async function recoverInterruptedSessionIfNeeded() {
+  const hadActiveSession = Boolean(runtimeSession.activeCommand);
+  const wasRunning = state.status === 'running';
+
+  if (!hadActiveSession && !state.mobileRuleEnabled) {
+    return;
+  }
+
+  if (!hadActiveSession) {
+    await disableMobileRulesSilently();
+    void scheduleRuntimePersist();
+    return;
+  }
+
+  const interruptedCommand = runtimeSession.activeCommand;
+  await disableMobileRulesSilently();
+
+  runtimeSession.activeCommand = null;
+  runtimeSession.startedAt = null;
+  runtimeSession.heartbeatAt = Date.now();
+  runtimeSession.heartbeatSource = 'recovery';
+
+  if (wasRunning) {
+    state.status = 'stopped';
+    state.progress = RECOVERED_STATE_PROGRESS;
+    state.mobile.status = state.mobile.status === 'done' ? 'done' : 'idle';
+    state.pc.status = state.pc.status === 'done' ? 'done' : 'idle';
+    log(`[Recovery] Restored persisted state after service worker restart during "${interruptedCommand}".`, 'warning');
+  } else {
+    void scheduleRuntimePersist();
+  }
+
+  await chrome.alarms.clear(ACTIVE_SESSION_ALARM_NAME).catch(() => {});
+  await persistRuntimeSession();
+}
+
+async function bootstrapKeywords() {
+  try {
+    const keywords = await refreshKeywordCache();
+
+    if (!runtimeSession.bootstrapLogged) {
+      runtimeSession.bootstrapLogged = true;
+      log(`[Init] Background module ready with ${keywords.length} keywords.`, 'success');
+      await persistRuntimeSession();
+    }
+  } catch (error) {
+    keywordCache = ['microsoft rewards'];
+
+    if (!runtimeSession.bootstrapLogged) {
+      runtimeSession.bootstrapLogged = true;
+      log(`[Init] Keyword bootstrap failed: ${error.message}`, 'warning');
+      await persistRuntimeSession();
+    }
+  }
+}
+
+async function initializeRuntime() {
+  const persisted = await getRuntimeStorageArea().get([
+    RUNTIME_STATE_KEY,
+    RUNTIME_LOGS_KEY,
+    RUNTIME_RECENT_KEYWORDS_KEY,
+    RUNTIME_SESSION_KEY
+  ]);
+
+  state = mergePersistedState(persisted[RUNTIME_STATE_KEY]);
+  logs = normalizeLogs(persisted[RUNTIME_LOGS_KEY]);
+  recentKeywords = normalizeRecentKeywords(persisted[RUNTIME_RECENT_KEYWORDS_KEY]);
+  runtimeSession = normalizeRuntimeSession(persisted[RUNTIME_SESSION_KEY]);
+
+  await recoverInterruptedSessionIfNeeded();
+  void bootstrapKeywords();
+}
+
+function ensureInitialized() {
+  if (!initPromise) {
+    initPromise = initializeRuntime().catch((error) => {
+      initPromise = null;
+      throw error;
+    });
+  }
+
+  return initPromise;
 }
 
 function applyCurrentPoints(points) {
@@ -568,32 +901,51 @@ async function pickKeyword() {
   const keyword = pool[randomInt(0, pool.length - 1)] || 'microsoft rewards';
 
   recentKeywords.push(keyword);
-  if (recentKeywords.length > 24) {
-    recentKeywords.splice(0, recentKeywords.length - 24);
+  if (recentKeywords.length > MAX_RECENT_KEYWORDS) {
+    recentKeywords.splice(0, recentKeywords.length - MAX_RECENT_KEYWORDS);
   }
 
+  void scheduleRuntimePersist();
   return keyword;
 }
 
-async function touchKeepAlive() {
-  try {
-    await chrome.runtime.getPlatformInfo();
-  } catch (error) {}
+async function createActiveSessionAlarm() {
+  await chrome.alarms.create(ACTIVE_SESSION_ALARM_NAME, {
+    periodInMinutes: ACTIVE_SESSION_ALARM_PERIOD_MINUTES
+  });
 }
 
-function startKeepAlive() {
+async function recordKeepAliveHeartbeat(source) {
+  runtimeSession.heartbeatAt = Date.now();
+  runtimeSession.heartbeatSource = source;
+  await persistRuntimeSession();
+}
+
+async function startKeepAlive(command) {
+  runtimeSession.activeCommand = command;
+  runtimeSession.startedAt = Date.now();
+  await createActiveSessionAlarm();
+  await recordKeepAliveHeartbeat('session_start');
+  void scheduleRuntimePersist();
+
   if (keepAliveTimer) return;
 
   keepAliveTimer = setInterval(() => {
-    touchKeepAlive().catch(() => {});
-  }, KEEP_ALIVE_INTERVAL_MS);
+    void recordKeepAliveHeartbeat('heartbeat');
+  }, KEEP_ALIVE_HEARTBEAT_MS);
 }
 
-function stopKeepAlive() {
-  if (!keepAliveTimer) return;
+async function stopKeepAlive() {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
 
-  clearInterval(keepAliveTimer);
-  keepAliveTimer = null;
+  runtimeSession.activeCommand = null;
+  runtimeSession.startedAt = null;
+  await chrome.alarms.clear(ACTIVE_SESSION_ALARM_NAME).catch(() => {});
+  await recordKeepAliveHeartbeat('session_end');
+  void scheduleRuntimePersist();
 }
 
 function assertNotStopped() {
@@ -604,20 +956,13 @@ function assertNotStopped() {
 
 async function waitWithStop(ms) {
   const deadline = Date.now() + Math.max(0, ms);
-  let nextKeepAliveAt = Date.now();
 
   while (Date.now() < deadline) {
     assertNotStopped();
 
     const now = Date.now();
-    if (now >= nextKeepAliveAt) {
-      await touchKeepAlive();
-      nextKeepAliveAt = now + KEEP_ALIVE_INTERVAL_MS;
-    }
-
     const remaining = deadline - now;
-    const untilKeepAlive = Math.max(0, nextKeepAliveAt - now);
-    const slice = Math.max(250, Math.min(WAIT_SLICE_MS, remaining, untilKeepAlive || WAIT_SLICE_MS));
+    const slice = Math.max(250, Math.min(WAIT_SLICE_MS, remaining));
     await sleep(slice);
   }
 }
@@ -643,7 +988,6 @@ async function waitForTabLoad(tabId, timeoutMs = TAB_LOAD_TIMEOUT_MS) {
 
   while (Date.now() - startedAt < timeoutMs) {
     assertNotStopped();
-    await touchKeepAlive();
 
     const tab = await getTabSafely(tabId);
     if (!tab) {
@@ -837,40 +1181,48 @@ async function runSearchAutomation(count, isMobile) {
         syncSearchState(branchKey, label);
         log(`[${label}] Search ${index}/${targetCount}: ${keyword}`);
 
-        await runSingleSearch(keyword, isMobile);
-        branch.executed += 1;
-        syncSearchState(branchKey, label);
-
-        const verification = await verifySearchOutcome(beforeSnapshot, branchKey, {
-          preferredKey,
-          label
-        });
-
-        snapshot = verification.afterSnapshot || snapshot;
-        branch.counter = cloneCounter(verification.afterCounter || getSnapshotCounter(snapshot, branchKey, preferredKey));
-        branch.verificationMode = verification.mode;
-        branch.verificationBadge = verification.mode === 'counter' ? SUCCESS_BADGE : FALLBACK_BADGE;
-        updateSummaryBadge();
-
-        if (verification.counted) {
-          counted = true;
-          branch.counted += 1;
-          branch.lastConfidence = verification.confidence;
-          branch.lastOutcome = `${label} search ${index}/${targetCount} counted`;
-          if (branch.counter) {
-            branch.remaining = branch.counter.remaining;
-          }
-          log(`[${label}] Search ${index} counted via ${verification.mode}${branch.counter ? ` (${formatCounter(branch.counter)})` : ''}`, 'success');
+        try {
+          await runSingleSearch(keyword, isMobile);
+          branch.executed += 1;
           syncSearchState(branchKey, label);
-          break;
+
+          const verification = await verifySearchOutcome(beforeSnapshot, branchKey, {
+            preferredKey,
+            label
+          });
+
+          snapshot = verification.afterSnapshot || snapshot;
+          branch.counter = cloneCounter(verification.afterCounter || getSnapshotCounter(snapshot, branchKey, preferredKey));
+          branch.verificationMode = verification.mode;
+          branch.verificationBadge = verification.mode === 'counter' ? SUCCESS_BADGE : FALLBACK_BADGE;
+          updateSummaryBadge();
+
+          if (verification.counted) {
+            counted = true;
+            branch.counted += 1;
+            branch.lastConfidence = verification.confidence;
+            branch.lastOutcome = `${label} search ${index}/${targetCount} counted`;
+            if (branch.counter) {
+              branch.remaining = branch.counter.remaining;
+            }
+            log(`[${label}] Search ${index} counted via ${verification.mode}${branch.counter ? ` (${formatCounter(branch.counter)})` : ''}`, 'success');
+            syncSearchState(branchKey, label);
+            break;
+          }
+
+          branch.lastOutcome = `${label} search ${index}/${targetCount} not counted`;
+          syncSearchState(branchKey, label);
+          log(`[${label}] Search ${index} was not confirmed by Rewards API.`, 'warning');
+        } catch (error) {
+          branch.lastOutcome = `${label} search ${index}/${targetCount} failed`;
+          syncSearchState(branchKey, label);
+          log(`[${label}] Search ${index} attempt ${retry + 1} failed: ${error.message}`, 'warning');
         }
 
-        branch.lastOutcome = `${label} search ${index}/${targetCount} not counted`;
-        syncSearchState(branchKey, label);
-        log(`[${label}] Search ${index} was not confirmed by Rewards API.`, 'warning');
-
         if (retry < config.maxRetries) {
-          await waitWithStop(randomInt(4000, 8000));
+          const retryDelayMs = buildRetryBackoffDelayMs(SEARCH_RETRY_BACKOFF_MS, retry);
+          log(`[${label}] Retry backoff ${Math.round(retryDelayMs / 1000)}s before re-opening a fresh tab.`, 'warning');
+          await waitWithStop(retryDelayMs);
         }
       }
 
@@ -897,6 +1249,28 @@ async function runSearchAutomation(count, isMobile) {
   return snapshot;
 }
 
+function summarizeTaskInteraction(taskResult) {
+  if (!taskResult || typeof taskResult !== 'object') {
+    return 'standard';
+  }
+
+  const mode = taskResult.mode || 'standard';
+  const answers = Number(taskResult.answersClicked || 0);
+  const clicked = Array.isArray(taskResult.clicked) ? taskResult.clicked.length : 0;
+  return `${mode} | answers ${answers} | clicks ${clicked}`;
+}
+
+async function verifyTaskCompletion(url) {
+  await waitWithStop(randomInt(...TASK_VERIFY_SETTLE_DELAY_MS));
+  const snapshot = await fetchPendingTaskSnapshot();
+
+  return {
+    completed: !hasPendingTaskUrl(snapshot.pendingUrls, url),
+    pendingUrls: snapshot.pendingUrls,
+    pendingKeys: snapshot.pendingKeys
+  };
+}
+
 async function runTaskVisit(url) {
   let tab = null;
 
@@ -914,13 +1288,16 @@ async function runTaskVisit(url) {
       throw new Error(taskResult?.error || 'runTaskPageInteraction failed');
     }
 
+    log(`[Tasks] Interaction mode: ${summarizeTaskInteraction(taskResult)}`);
     if (Array.isArray(taskResult?.clicked) && taskResult.clicked.length > 0) {
       log(`[Tasks] Clicked ${taskResult.clicked.length} action(s) on task page.`);
     }
 
-    const dwellMs = randomInt(...TASK_DWELL_DELAY_MS);
-    log(`[Tasks] Waiting ${Math.round(dwellMs / 1000)}s on task page.`);
+    // Anti-ban: giữ tab mở 6-15 giây để Bing có thời gian ghi nhận điểm như một phiên tương tác thật.
+    const dwellMs = randomInt(6000, 15000);
+    log(`[Tasks] Anti-ban dwell ${Math.round(dwellMs / 1000)}s before closing task tab.`);
     await waitWithStop(dwellMs);
+    return taskResult;
   } finally {
     if (tab?.id) {
       await closeTab(tab.id);
@@ -944,59 +1321,145 @@ async function scrapePointsFromRewardsPage() {
 }
 
 async function runDailyTasksAutomation() {
+  const config = await getConfig();
   resetRuntimeState();
   state.status = 'running';
   state.progress = 'Tasks';
   state.percent = 0;
   broadcastState();
-  startKeepAlive();
+  await startKeepAlive('daily_tasks');
 
   try {
-    const taskUrls = await fetchPendingDailyTaskUrls();
+    const initialSnapshot = await fetchPendingTaskSnapshot();
+    const taskUrls = initialSnapshot.pendingUrls;
+    const sourceSummary = initialSnapshot.sources || {};
+    let latestPendingUrls = [...taskUrls];
     state.tasks.planned = taskUrls.length;
     state.tasks.pending = taskUrls.length;
-    state.tasks.lastSource = 'api';
-    state.tasks.lastOutcome = taskUrls.length > 0 ? 'Pending tasks loaded from Rewards API' : 'No pending daily tasks';
+    state.tasks.lastSource = 'dashboard+api';
+    state.tasks.lastOutcome = taskUrls.length > 0
+      ? 'Pending tasks loaded from Rewards Dashboard + API'
+      : 'No pending dashboard tasks';
     syncTaskState();
+
+    if (sourceSummary.dashboardError) {
+      log(`[Tasks] Dashboard scrape warning: ${sourceSummary.dashboardError}`, 'warning');
+    }
+    if (sourceSummary.apiError) {
+      log(`[Tasks] API fallback warning: ${sourceSummary.apiError}`, 'warning');
+    }
+    log(
+      `[Tasks] Dashboard scan found ${sourceSummary.dashboardCount || 0} URL(s) across ${sourceSummary.dashboardVisitedCards || 0} card(s); API reported ${sourceSummary.apiCount || 0}.`
+    );
 
     if (taskUrls.length === 0) {
       state.status = 'done';
       state.progress = 'Completed';
       state.percent = 100;
-      state.summary.verificationBadge = 'API Tasks';
-      log('[Tasks] Rewards API returned no pending daily tasks.');
+      state.summary.verificationBadge = 'Dashboard Tasks';
+      log('[Tasks] Rewards Dashboard has no pending tasks.');
       broadcastState();
       return;
     }
 
-    log(`[Tasks] Rewards API returned ${taskUrls.length} pending task URL(s).`);
+    log(`[Tasks] Combined task queue contains ${taskUrls.length} pending URL(s).`);
 
     for (let index = 0; index < taskUrls.length; index += 1) {
       assertNotStopped();
 
       const url = taskUrls[index];
-      state.tasks.lastOutcome = `Opening task ${index + 1}/${taskUrls.length}`;
-      syncTaskState();
-      log(`[Tasks] Opening ${index + 1}/${taskUrls.length}: ${url}`);
+      if (!hasPendingTaskUrl(latestPendingUrls, url)) {
+        state.tasks.completed = Math.max(state.tasks.completed, state.tasks.planned - latestPendingUrls.length);
+        state.tasks.executed = state.tasks.completed;
+        state.tasks.pending = latestPendingUrls.length;
+        state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} already cleared by API`;
+        syncTaskState();
+        log(`[Tasks] Skipping already-cleared task ${index + 1}/${taskUrls.length}.`);
+      } else {
+        let taskCompleted = false;
 
-      await runTaskVisit(url);
+        for (let retry = 0; retry <= config.maxRetries; retry += 1) {
+          state.tasks.lastOutcome = `Opening task ${index + 1}/${taskUrls.length}${retry > 0 ? ` retry ${retry}` : ''}`;
+          syncTaskState();
+          // Anti-ban: luôn xử lý tuần tự từng tab một, không mở đồng thời nhiều task để tránh bị đánh dấu spam.
+          log(`[Tasks] Opening ${index + 1}/${taskUrls.length}${retry > 0 ? ` retry ${retry}` : ''}: ${url}`);
 
-      state.tasks.executed += 1;
-      state.tasks.completed += 1;
-      state.tasks.pending = Math.max(0, taskUrls.length - state.tasks.executed);
-      state.tasks.lastOutcome = `Visited task ${index + 1}/${taskUrls.length}`;
-      syncTaskState();
+          try {
+            await runTaskVisit(url);
+            const verification = await verifyTaskCompletion(url);
+            latestPendingUrls = verification.pendingUrls;
+            state.tasks.pending = latestPendingUrls.length;
+
+            if (verification.completed) {
+              taskCompleted = true;
+              state.tasks.completed = Math.max(state.tasks.completed + 1, state.tasks.planned - latestPendingUrls.length);
+              state.tasks.executed = state.tasks.completed;
+              state.tasks.lastOutcome = `Completed task ${index + 1}/${taskUrls.length}`;
+              syncTaskState();
+              log(`[Tasks] Task ${index + 1} verified by Dashboard snapshot.`, 'success');
+              break;
+            }
+
+            state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} still pending after attempt ${retry + 1}`;
+            syncTaskState();
+            log(`[Tasks] Task ${index + 1} was not removed from the pending list after attempt ${retry + 1}.`, 'warning');
+          } catch (error) {
+            state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} failed`;
+            syncTaskState();
+            log(`[Tasks] Task ${index + 1} attempt ${retry + 1} failed: ${error.message}`, 'warning');
+          }
+
+          if (retry < config.maxRetries) {
+            const retryDelayMs = buildRetryBackoffDelayMs(TASK_RETRY_BACKOFF_MS, retry);
+            log(`[Tasks] Retry backoff ${Math.round(retryDelayMs / 1000)}s before opening a fresh task tab.`, 'warning');
+            await waitWithStop(retryDelayMs);
+          }
+        }
+
+        if (!taskCompleted) {
+          state.tasks.fallbackUsed = true;
+
+          try {
+            const verification = await fetchPendingTaskSnapshot();
+            latestPendingUrls = verification.pendingUrls;
+            state.tasks.pending = latestPendingUrls.length;
+          } catch (error) {}
+
+          state.tasks.completed = Math.max(0, state.tasks.planned - state.tasks.pending);
+          state.tasks.executed = state.tasks.completed;
+          state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} exhausted retries`;
+          syncTaskState();
+          log(`[Tasks] Task ${index + 1} exhausted retries and remains pending.`, 'warning');
+        }
+      }
 
       if (index < taskUrls.length - 1) {
+        // Anti-ban: nghỉ ngắn giữa hai task để nhịp mở tab không quá dày đặc.
         await waitWithStop(randomInt(...TASK_COOLDOWN_DELAY_MS));
       }
     }
 
+    try {
+      const finalSnapshot = await fetchPendingTaskSnapshot();
+      latestPendingUrls = finalSnapshot.pendingUrls;
+      state.tasks.pending = latestPendingUrls.length;
+    } catch (error) {}
+
+    state.tasks.completed = Math.max(0, state.tasks.planned - state.tasks.pending);
+    state.tasks.executed = state.tasks.completed;
     state.status = 'done';
     state.progress = 'Completed';
     state.percent = 100;
-    state.summary.verificationBadge = 'API Tasks';
-    log('[Tasks] Daily tasks automation completed.', 'success');
+    state.summary.verificationBadge = 'Dashboard Tasks';
+    state.tasks.lastOutcome = state.tasks.pending === 0
+      ? 'All tasks verified by Rewards Dashboard'
+      : `${state.tasks.pending} task(s) still pending after retries`;
+    log(
+      state.tasks.pending === 0
+        ? '[Tasks] Daily tasks automation completed.'
+        : `[Tasks] Daily tasks automation finished with ${state.tasks.pending} pending task(s).`,
+      state.tasks.pending === 0 ? 'success' : 'warning'
+    );
     broadcastState();
   } catch (error) {
     if (error.message === USER_STOPPED_ERROR) {
@@ -1015,7 +1478,7 @@ async function runDailyTasksAutomation() {
     broadcastState();
   } finally {
     await setMobileMode(false);
-    stopKeepAlive();
+    await stopKeepAlive();
   }
 }
 
@@ -1028,7 +1491,7 @@ async function runStartAutomation() {
   state.progress = 'Preparing';
   state.percent = 0;
   broadcastState();
-  startKeepAlive();
+  await startKeepAlive('start_search');
 
   try {
     const baselineSnapshot = await fetchRewardsDashboard({
@@ -1082,7 +1545,7 @@ async function runStartAutomation() {
     broadcastState();
   } finally {
     await setMobileMode(false);
-    stopKeepAlive();
+    await stopKeepAlive();
   }
 }
 
@@ -1134,8 +1597,17 @@ async function handleCommand(command) {
       return;
 
     case 'reset_progress':
+      if (activeRunPromise) {
+        state.status = 'stopped';
+        state.progress = 'Stopped';
+        state.percent = 0;
+        broadcastState();
+        log('[Reset] Stop requested. Clear progress again after the active run exits.', 'warning');
+        return;
+      }
+
       await setMobileMode(false);
-      stopKeepAlive();
+      await stopKeepAlive();
       resetRuntimeState();
       log('[Reset] Runtime state cleared', 'success');
       return;
@@ -1152,6 +1624,8 @@ async function handleCommand(command) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    await ensureInitialized();
+
     if (message.action === 'get_state') {
       sendResponse({
         state: getPublicState(),
@@ -1190,23 +1664,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-chrome.runtime.onInstalled.addListener(async () => {
-  await chrome.storage.local.set({ config: await getConfig() });
-  await setMobileMode(false);
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== ACTIVE_SESSION_ALARM_NAME) {
+    return;
+  }
+
+  (async () => {
+    await ensureInitialized();
+
+    if (!runtimeSession.activeCommand) {
+      await chrome.alarms.clear(ACTIVE_SESSION_ALARM_NAME).catch(() => {});
+      return;
+    }
+
+    await recordKeepAliveHeartbeat('alarm');
+  })().catch((error) => {
+    console.warn('[Alarm] Active-session watchdog failed:', error);
+  });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  (async () => {
+    await ensureInitialized();
+    await chrome.storage.local.set({ config: await getConfig() });
+    await disableMobileRulesSilently();
+    await stopKeepAlive();
+    broadcastState();
+  })().catch((error) => {
+    console.warn('[Lifecycle] onInstalled failed:', error);
+  });
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  setMobileMode(false).catch(() => {});
-  broadcastState();
-});
-
-refreshKeywordCache()
-  .then((keywords) => {
-    log(`[Init] Background module ready with ${keywords.length} keywords.`, 'success');
+  (async () => {
+    await ensureInitialized();
+    await disableMobileRulesSilently();
     broadcastState();
   })
-  .catch((error) => {
-    keywordCache = ['microsoft rewards'];
-    log(`[Init] Keyword bootstrap failed: ${error.message}`, 'warning');
-    broadcastState();
+    .catch((error) => {
+      console.warn('[Lifecycle] onStartup failed:', error);
+    });
   });
+
+void ensureInitialized();

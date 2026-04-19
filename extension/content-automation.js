@@ -1,5 +1,5 @@
 (function installRewardsAutomationApi() {
-  const VERSION = '5.1.0';
+  const VERSION = '5.2.0';
 
   if (window.__BRA__ && window.__BRA__.version === VERSION) {
     return;
@@ -39,6 +39,47 @@
 
   const DISMISS_TEXT_RE = /close|dismiss|not now|no thanks|skip|maybe later|got it|ok(?:ay)?|accept|agree|continue to site|continue without|stay on page|hide/i;
   const BLOCKING_TEXT_RE = /cookie|consent|survey|edge|install|app|popup|pop-up|modal|overlay|dialog|newsletter|subscribe|sign in|signin|prompt|tip|offer/i;
+  const TASK_ACTION_TEXT_RE = /(start|play|claim|view|continue|check.?in|quiz|poll|read|click|earn|get points|try now|join now|see more|learn more|vote|answer|next|submit)/i;
+  const TASK_START_TEXT_RE = /(start|play|continue|next|begin|resume|take quiz|take poll|show options|answer now)/i;
+  const TASK_QUIZ_TEXT_RE = /\bquiz\b|trivia|question\s*\d+|answer and earn|correct answer|select one answer|true or false/i;
+  const TASK_POLL_TEXT_RE = /\bpoll\b|vote|your opinion|which would you choose|pick one|cast your vote/i;
+  const TASK_COMPLETE_TEXT_RE = /congratulations|great job|well done|thanks for playing|you.?re done|all done|completed|come back tomorrow|points added|earned points|keep exploring/i;
+  const TASK_START_SELECTORS = [
+    '#rqStartQuiz',
+    '[id*="rqStartQuiz" i]',
+    '[id*="startQuiz" i]',
+    '[data-bi-id*="start" i]',
+    '.wk_button',
+    'button[class*="quiz" i]',
+    'button[class*="poll" i]'
+  ];
+  const TASK_OPTION_SELECTORS = [
+    '[id^="rqAnswerOption"]',
+    '[id^="btoption"]',
+    '[id^="quizAnswerOption"]',
+    '.b_cards [id^="rqAnswerOption"]',
+    '.b_cards [id^="btoption"]',
+    '.b_cards button',
+    '.b_cards [role="button"]',
+    '.b_cards a',
+    '[class*="quiz" i] button',
+    '[class*="quiz" i] [role="button"]',
+    '[class*="poll" i] button',
+    '[class*="poll" i] [role="button"]',
+    '.wk_button',
+    '[data-option]'
+  ];
+  const TASK_PROGRESS_SELECTORS = [
+    'button[id*="next" i]',
+    'button[id*="continue" i]',
+    'button[id*="submit" i]',
+    'button[class*="next" i]',
+    'button[class*="continue" i]',
+    'button[class*="submit" i]',
+    '[role="button"][id*="next" i]',
+    '[role="button"][id*="continue" i]',
+    '[role="button"][id*="submit" i]'
+  ];
 
   function nativeSetValue(element, value) {
     if (!element) return;
@@ -695,6 +736,325 @@
     };
   }
 
+  function dedupeElements(elements) {
+    const seen = new Set();
+    const unique = [];
+
+    elements.forEach((element) => {
+      if (!element || seen.has(element)) return;
+      seen.add(element);
+      unique.push(element);
+    });
+
+    return unique;
+  }
+
+  function getTaskTextSnapshot() {
+    return (document.body?.innerText || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 8000);
+  }
+
+  function getTaskElementKey(element) {
+    if (!element) return '';
+
+    const text = getElementText(element)
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .slice(0, 120);
+
+    return [
+      element.id || '',
+      element.getAttribute?.('data-option') || '',
+      element.getAttribute?.('data-bi-id') || '',
+      text
+    ].join('|');
+  }
+
+  function collectTaskActionCandidates() {
+    return dedupeElements([
+      ...Array.from(document.querySelectorAll('a[href], button, [role="button"]')),
+      ...TASK_START_SELECTORS.flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+    ])
+      .filter((element) => isInteractableElement(element))
+      .filter((element) => !element.closest('header, nav, footer'));
+  }
+
+  function findTaskStartButtons() {
+    const selectorMatches = TASK_START_SELECTORS.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+    const genericMatches = collectTaskActionCandidates().filter((element) => TASK_START_TEXT_RE.test(getElementText(element)));
+
+    return dedupeElements([...selectorMatches, ...genericMatches])
+      .filter((element) => isVisibleElement(element))
+      .slice(0, 8);
+  }
+
+  function findTaskAnswerOptions() {
+    const selectorMatches = TASK_OPTION_SELECTORS.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+    const cardMatches = Array.from(document.querySelectorAll('.b_cards > *, [class*="rq" i], [class*="quiz" i] > *, [class*="poll" i] > *'))
+      .filter((element) => element.matches?.('button, a, [role="button"], div, article, li'));
+
+    return dedupeElements([...selectorMatches, ...cardMatches])
+      .filter((element) => isInteractableElement(element))
+      .filter((element) => !element.closest('header, nav, footer'))
+      .filter((element) => {
+        const key = getTaskElementKey(element);
+        return key && key !== '|||';
+      })
+      .slice(0, 12);
+  }
+
+  function findTaskProgressButtons() {
+    const selectorMatches = TASK_PROGRESS_SELECTORS.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+    const genericMatches = collectTaskActionCandidates().filter((element) => {
+      const label = getElementText(element);
+      return /continue|next|submit|done|see results|show answer|finish/i.test(label);
+    });
+
+    return dedupeElements([...selectorMatches, ...genericMatches])
+      .filter((element) => isVisibleElement(element))
+      .slice(0, 8);
+  }
+
+  function detectTaskInteractionMode() {
+    const pageText = getTaskTextSnapshot();
+    const options = findTaskAnswerOptions();
+    const optionIds = options.map((element) => element.id || '');
+    const hasRewardsQuizIds = optionIds.some((id) => /^rqAnswerOption/i.test(id));
+    const hasRewardsPollIds = optionIds.some((id) => /^btoption/i.test(id));
+    const hasRewardsStartSelector = Boolean(document.querySelector('#rqStartQuiz, [id*="rqStartQuiz" i], [id*="startQuiz" i]'));
+    const hasQuizContainer = Boolean(document.querySelector('.b_cards, [id*="quiz" i], [class*="quiz" i]'));
+    const hasPollContainer = Boolean(document.querySelector('[id*="poll" i], [class*="poll" i], [id^="btoption"]'));
+    const hasWkButton = Boolean(document.querySelector('.wk_button'));
+
+    if (hasRewardsPollIds || (hasPollContainer && TASK_POLL_TEXT_RE.test(pageText) && options.length >= 2)) {
+      return { mode: 'poll', options, pageText };
+    }
+
+    if (
+      hasRewardsQuizIds
+      || ((hasRewardsStartSelector || hasQuizContainer || hasWkButton) && (TASK_QUIZ_TEXT_RE.test(pageText) || options.length >= 2))
+    ) {
+      return { mode: 'quiz', options, pageText };
+    }
+
+    return { mode: 'standard', options, pageText };
+  }
+
+  function isTaskCompleted() {
+    const completionSelectors = [
+      '[class*="complete" i]',
+      '[class*="completed" i]',
+      '[data-stage="complete"]',
+      '[data-state="complete"]'
+    ];
+
+    if (completionSelectors.some((selector) => document.querySelector(selector))) {
+      return true;
+    }
+
+    const pageText = getTaskTextSnapshot();
+    return TASK_COMPLETE_TEXT_RE.test(pageText) && findTaskAnswerOptions().length === 0;
+  }
+
+  async function clickTaskElement(element) {
+    if (!element) return false;
+
+    try {
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      await sleep(randomInt(280, 520));
+
+      const rect = element.getBoundingClientRect();
+      const clientX = rect.left + Math.max(5, Math.min(rect.width - 5, rect.width / 2));
+      const clientY = rect.top + Math.max(5, Math.min(rect.height - 5, rect.height / 2));
+      const mouseOptions = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX,
+        clientY
+      };
+
+      element.dispatchEvent(new MouseEvent('mouseover', mouseOptions));
+      element.dispatchEvent(new MouseEvent('mousemove', mouseOptions));
+      element.dispatchEvent(new MouseEvent('mousedown', mouseOptions));
+      element.dispatchEvent(new MouseEvent('mouseup', mouseOptions));
+      element.click();
+
+      await sleep(randomInt(180, 360));
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async function maybeStartTaskInteraction(result) {
+    const startButtons = findTaskStartButtons();
+
+    for (const button of startButtons) {
+      const label = getElementText(button);
+      if (!TASK_START_TEXT_RE.test(label)) continue;
+
+      if (await clickTaskElement(button)) {
+        result.started = true;
+        result.clicked.push(label.substring(0, 80));
+        dismissBlockingUi();
+        await sleep(randomInt(900, 1500));
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  async function maybeAdvanceTaskInteraction(result) {
+    const progressButtons = findTaskProgressButtons();
+
+    for (const button of progressButtons) {
+      const label = getElementText(button);
+      if (!/continue|next|submit|done|see results|show answer|finish/i.test(label)) continue;
+
+      if (await clickTaskElement(button)) {
+        result.clicked.push(label.substring(0, 80));
+        dismissBlockingUi();
+        await sleep(randomInt(900, 1400));
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  async function solveTaskPoll(result) {
+    const options = findTaskAnswerOptions();
+    if (!options.length) return false;
+
+    const choice = options[randomInt(0, options.length - 1)];
+    const label = getElementText(choice);
+    const clicked = await clickTaskElement(choice);
+
+    if (!clicked) return false;
+
+    result.answersClicked += 1;
+    result.clicked.push(label.substring(0, 80));
+    dismissBlockingUi();
+    await sleep(randomInt(1400, 2200));
+    await maybeAdvanceTaskInteraction(result);
+    return true;
+  }
+
+  async function solveTaskQuiz(result) {
+    let lastSignature = '';
+    let triedForSignature = new Set();
+    let idleLoops = 0;
+
+    for (let step = 0; step < 12; step += 1) {
+      dismissBlockingUi();
+
+      if (isTaskCompleted()) {
+        return true;
+      }
+
+      const started = await maybeStartTaskInteraction(result);
+      if (started) {
+        idleLoops = 0;
+      }
+
+      const options = findTaskAnswerOptions();
+      if (!options.length) {
+        const advanced = await maybeAdvanceTaskInteraction(result);
+        if (advanced) {
+          idleLoops = 0;
+          continue;
+        }
+
+        idleLoops += 1;
+        if (idleLoops >= 2) {
+          break;
+        }
+
+        await sleep(randomInt(1000, 1600));
+        continue;
+      }
+
+      const signature = options.map((element) => getTaskElementKey(element)).join('||');
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        triedForSignature = new Set();
+      }
+
+      const nextOption = options.find((element) => !triedForSignature.has(getTaskElementKey(element)))
+        || options[randomInt(0, options.length - 1)];
+      const optionKey = getTaskElementKey(nextOption);
+      const label = getElementText(nextOption);
+
+      triedForSignature.add(optionKey);
+
+      if (!await clickTaskElement(nextOption)) {
+        idleLoops += 1;
+        if (idleLoops >= 3) break;
+        continue;
+      }
+
+      result.answersClicked += 1;
+      result.clicked.push(label.substring(0, 80));
+      dismissBlockingUi();
+      await sleep(randomInt(1200, 2200));
+      await maybeAdvanceTaskInteraction(result);
+      await sleep(randomInt(900, 1500));
+
+      const updatedSignature = findTaskAnswerOptions().map((element) => getTaskElementKey(element)).join('||');
+      idleLoops = updatedSignature && updatedSignature === signature ? idleLoops + 1 : 0;
+
+      if (isTaskCompleted()) {
+        return true;
+      }
+
+      if (idleLoops >= 3) {
+        break;
+      }
+    }
+
+    return result.answersClicked > 0;
+  }
+
+  async function performStandardTaskInteraction(result) {
+    const candidates = collectTaskActionCandidates().slice(0, 60);
+
+    for (const element of candidates) {
+      const label = getElementText(element);
+      if (!label || !TASK_ACTION_TEXT_RE.test(label)) continue;
+
+      if (await clickTaskElement(element)) {
+        result.clicked.push(label.substring(0, 80));
+        dismissBlockingUi();
+        await sleep(randomInt(1200, 2000));
+        if (result.clicked.length >= 2) break;
+      }
+    }
+
+    const scrollSteps = randomInt(3, 5);
+    for (let index = 0; index < scrollSteps; index += 1) {
+      window.scrollBy({
+        top: randomInt(180, 420),
+        behavior: 'smooth'
+      });
+      await sleep(randomInt(500, 900));
+      dismissBlockingUi();
+    }
+
+    if (Math.random() > 0.4) {
+      window.scrollBy({
+        top: -randomInt(90, 180),
+        behavior: 'smooth'
+      });
+      await sleep(randomInt(400, 700));
+    }
+
+    return result.clicked.length > 0;
+  }
+
   async function runTaskPageInteraction(options = {}) {
     if (options.mobile) {
       applyMobileProfile();
@@ -703,34 +1063,70 @@
     dismissBlockingUi();
     await sleep(randomInt(700, 1200));
 
-    const actionWords = /(start|play|claim|view|continue|check.?in|quiz|poll|read|click|earn|get points|try now|join now|see more|learn more)/i;
-    const clicked = [];
-    const candidates = Array.from(document.querySelectorAll('a[href], button, [role="button"]'))
+    const previewTargets = dedupeElements([
+      ...findTaskStartButtons(),
+      ...findTaskAnswerOptions(),
+      ...collectTaskActionCandidates()
+    ])
       .filter((element) => isVisibleElement(element))
-      .filter((element) => !element.closest('header, nav'))
-      .slice(0, 60);
+      .sort(() => Math.random() - 0.5)
+      .slice(0, randomInt(2, 4));
 
-    for (const element of candidates) {
-      const label = [
-        element.getAttribute('aria-label'),
-        element.getAttribute('title'),
-        element.textContent
-      ].join(' ').trim();
+    if (previewTargets.length > 0) {
+      for (const target of previewTargets) {
+        // Anti-ban: cuộn qua vài điểm trên trang rồi dừng 1-2 giây như người thật đang đọc nội dung task.
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await sleep(randomInt(1000, 2000));
 
-      if (!label || !actionWords.test(label)) continue;
+        if (Math.random() < 0.7) {
+          window.scrollBy({
+            top: randomInt(-90, 160),
+            behavior: 'smooth'
+          });
+          await sleep(randomInt(350, 700));
+        }
 
-      try {
-        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await sleep(randomInt(350, 650));
-        element.click();
-        clicked.push(label.substring(0, 80));
         dismissBlockingUi();
-        await sleep(randomInt(1200, 2000));
-        if (clicked.length >= 2) break;
-      } catch (error) {}
+      }
+    } else {
+      // Anti-ban: nếu chưa thấy nút rõ ràng thì vẫn lướt nhẹ để tránh click ngay lập tức khi vừa load trang.
+      for (let index = 0; index < 2; index += 1) {
+        window.scrollBy({
+          top: randomInt(120, 260) * (index === 0 ? 1 : -1),
+          behavior: 'smooth'
+        });
+        await sleep(randomInt(900, 1500));
+      }
     }
 
-    return { success: true, clicked };
+    const result = {
+      success: true,
+      mode: 'standard',
+      clicked: [],
+      answersClicked: 0,
+      started: false,
+      completed: false
+    };
+
+    const detection = detectTaskInteractionMode();
+    result.mode = detection.mode;
+
+    if (detection.mode === 'poll') {
+      await maybeStartTaskInteraction(result);
+      const solved = await solveTaskPoll(result);
+      result.completed = solved || isTaskCompleted();
+      return result;
+    }
+
+    if (detection.mode === 'quiz') {
+      const solved = await solveTaskQuiz(result);
+      result.completed = solved || isTaskCompleted();
+      return result;
+    }
+
+    await performStandardTaskInteraction(result);
+    result.completed = isTaskCompleted();
+    return result;
   }
 
   async function collectDashboardTaskLinks(options = {}) {
@@ -738,52 +1134,154 @@
       applyMobileProfile();
     }
 
-    dismissBlockingUi();
-    await sleep(400);
-
-    for (let index = 0; index < 4; index += 1) {
-      window.scrollBy({ top: 280, behavior: 'smooth' });
-      await sleep(350);
-    }
-
-    window.scrollTo({ top: 0, behavior: 'auto' });
-    await sleep(400);
-
-    const seen = new Set();
-    const tasks = [];
-    const selectors = [
+    const taskLinkSelectors = [
       'a[href][target="_blank"][class*="cursor-pointer"]',
       'a[href*="bing.com"]',
       'a[href*="rewards.bing.com"]',
       'a[href*="microsoft.com"]',
-      'a[href*="msn.com"]'
+      'a[href*="msn.com"]',
+      'a[href*="/search?"]',
+      'a[href*="quiz"]',
+      'a[href*="poll"]'
     ];
+    const taskCardSelectors = [
+      'mee-card',
+      'article',
+      'section',
+      'li',
+      '[role="listitem"]',
+      '[class*="activity" i]',
+      '[class*="offer" i]',
+      '[class*="card" i]',
+      '[class*="punch" i]',
+      '[class*="daily" i]',
+      '[class*="set" i]'
+    ];
+    const seen = new Set();
+    const visitedCards = new WeakSet();
+    const tasks = [];
+    let cardsVisited = 0;
 
-    const isCompleted = (node) => {
-      const text = node?.textContent || '';
-      if (/completed|done|hoan thanh|da hoan thanh/i.test(text)) return true;
-      return Boolean(node?.querySelector?.('.sw-checkmark, .completed, [class*="checkmark"], [class*="done"]'));
+    const isSupportedTaskLink = (href) => /^https?:/i.test(href || '')
+      && /bing\.com|rewards\.bing\.com|microsoft\.com|msn\.com/i.test(href || '');
+
+    const findTaskCard = (element) => {
+      for (const selector of taskCardSelectors) {
+        const card = element.closest?.(selector);
+        if (card) return card;
+      }
+
+      return element.closest?.('a, div, article, section, li') || element;
     };
 
-    selectors.forEach((selector) => {
-      document.querySelectorAll(selector).forEach((link) => {
-        if (!isVisibleElement(link)) return;
-        if (isCompleted(link) || isCompleted(link.closest('a, div, section'))) return;
+    const isCompletedTaskCard = (node) => {
+      const card = findTaskCard(node);
+      const text = getElementText(card);
 
-        const href = link.href || '';
-        if (!/^https?:/i.test(href)) return;
-        if (!/bing\.com|rewards\.bing\.com|microsoft\.com|msn\.com/i.test(href)) return;
-        if (seen.has(href)) return;
+      if (/completed|done|hoan thanh|da hoan thanh|daily set completed/i.test(text)) {
+        return true;
+      }
 
-        seen.add(href);
-        tasks.push({
-          url: href,
-          text: (link.textContent || '').trim().substring(0, 100)
+      return Boolean(card?.querySelector?.(
+        '.sw-checkmark, .completed, [class*="checkmark"], [class*="completed"], [class*="done"], [data-icon-name*="check" i], svg[aria-label*="check" i], svg[aria-label*="completed" i]'
+      ));
+    };
+
+    const collectTaskLinksInDocument = () => {
+      taskLinkSelectors.forEach((selector) => {
+        document.querySelectorAll(selector).forEach((link) => {
+          if (!isVisibleElement(link)) return;
+
+          const href = link.href || '';
+          if (!isSupportedTaskLink(href)) return;
+
+          const card = findTaskCard(link);
+          if (isCompletedTaskCard(card) || isCompletedTaskCard(link)) return;
+
+          const dedupKey = href.replace(/#.*$/, '');
+          if (seen.has(dedupKey)) return;
+
+          seen.add(dedupKey);
+          tasks.push({
+            url: dedupKey,
+            text: getElementText(card || link).substring(0, 140)
+          });
         });
       });
-    });
+    };
 
-    return { tasks: tasks.slice(0, options.mobile ? 8 : 6) };
+    const getVisibleCards = () => dedupeElements(
+      taskCardSelectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+    )
+      .filter((card) => isVisibleElement(card))
+      .filter((card) => {
+        const rect = card.getBoundingClientRect();
+        return rect.bottom > 0 && rect.top < window.innerHeight;
+      })
+      .filter((card) => card.querySelector?.('a[href]'));
+
+    dismissBlockingUi();
+    await sleep(randomInt(700, 1200));
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    await sleep(randomInt(500, 900));
+    collectTaskLinksInDocument();
+
+    let safetyCounter = 0;
+
+    while (safetyCounter < 30) {
+      const visibleCards = getVisibleCards();
+
+      for (const card of visibleCards) {
+        if (visitedCards.has(card)) continue;
+        visitedCards.add(card);
+        cardsVisited += 1;
+
+        // Anti-ban: dừng 1-2 giây trên từng card để mô phỏng người dùng đang đọc nhiệm vụ trước khi thu thập link.
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await sleep(randomInt(1000, 2000));
+
+        if (Math.random() < 0.65) {
+          window.scrollBy({
+            top: randomInt(-70, 130),
+            behavior: 'smooth'
+          });
+          await sleep(randomInt(300, 650));
+        }
+
+        dismissBlockingUi();
+        collectTaskLinksInDocument();
+      }
+
+      const maxScrollTop = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      if (window.scrollY >= maxScrollTop - 20) {
+        break;
+      }
+
+      // Anti-ban: cuộn theo từng đoạn ngắn thay vì nhảy thẳng xuống cuối trang để kích hoạt lazy-load tự nhiên hơn.
+      const nextTop = Math.min(maxScrollTop, window.scrollY + randomInt(360, 720));
+      window.scrollTo({
+        top: nextTop,
+        behavior: 'smooth'
+      });
+      await sleep(randomInt(900, 1600));
+      dismissBlockingUi();
+      collectTaskLinksInDocument();
+      safetyCounter += 1;
+    }
+
+    if (tasks.length > 0 && Math.random() > 0.35) {
+      window.scrollBy({
+        top: -randomInt(180, 340),
+        behavior: 'smooth'
+      });
+      await sleep(randomInt(800, 1400));
+      collectTaskLinksInDocument();
+    }
+
+    return {
+      tasks,
+      cardsVisited
+    };
   }
 
   window.__BRA__ = {
