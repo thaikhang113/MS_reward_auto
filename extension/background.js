@@ -36,6 +36,7 @@ const TASK_DWELL_DELAY_MS = [5000, 10000];
 const TASK_COOLDOWN_DELAY_MS = [1500, 3000];
 const TASK_RETRY_BACKOFF_MS = [5000, 11000];
 const TASK_VERIFY_SETTLE_DELAY_MS = [2500, 4500];
+const MAX_TASK_ATTEMPTS = 3;
 const SUCCESS_BADGE = 'API Verified';
 const FALLBACK_BADGE = 'Fallback';
 const MAX_RUNTIME_LOGS = 200;
@@ -1293,8 +1294,8 @@ async function runTaskVisit(url) {
       log(`[Tasks] Clicked ${taskResult.clicked.length} action(s) on task page.`);
     }
 
-    // Anti-ban: giữ tab mở 6-15 giây để Bing có thời gian ghi nhận điểm như một phiên tương tác thật.
-    const dwellMs = randomInt(6000, 15000);
+    // Anti-ban: giữ tab mở 8-15 giây để Bing có thời gian ghi nhận điểm như một phiên tương tác thật.
+    const dwellMs = randomInt(8000, 15000);
     log(`[Tasks] Anti-ban dwell ${Math.round(dwellMs / 1000)}s before closing task tab.`);
     await waitWithStop(dwellMs);
     return taskResult;
@@ -1321,7 +1322,6 @@ async function scrapePointsFromRewardsPage() {
 }
 
 async function runDailyTasksAutomation() {
-  const config = await getConfig();
   resetRuntimeState();
   state.status = 'running';
   state.progress = 'Tasks';
@@ -1378,11 +1378,11 @@ async function runDailyTasksAutomation() {
       } else {
         let taskCompleted = false;
 
-        for (let retry = 0; retry <= config.maxRetries; retry += 1) {
-          state.tasks.lastOutcome = `Opening task ${index + 1}/${taskUrls.length}${retry > 0 ? ` retry ${retry}` : ''}`;
+        for (let attempt = 1; attempt <= MAX_TASK_ATTEMPTS; attempt += 1) {
+          state.tasks.lastOutcome = `Opening task ${index + 1}/${taskUrls.length}${attempt > 1 ? ` retry ${attempt - 1}` : ''}`;
           syncTaskState();
           // Anti-ban: luôn xử lý tuần tự từng tab một, không mở đồng thời nhiều task để tránh bị đánh dấu spam.
-          log(`[Tasks] Opening ${index + 1}/${taskUrls.length}${retry > 0 ? ` retry ${retry}` : ''}: ${url}`);
+          log(`[Tasks] Opening ${index + 1}/${taskUrls.length}${attempt > 1 ? ` retry ${attempt - 1}` : ''}: ${url}`);
 
           try {
             await runTaskVisit(url);
@@ -1400,17 +1400,17 @@ async function runDailyTasksAutomation() {
               break;
             }
 
-            state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} still pending after attempt ${retry + 1}`;
+            state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} still pending after attempt ${attempt}`;
             syncTaskState();
-            log(`[Tasks] Task ${index + 1} was not removed from the pending list after attempt ${retry + 1}.`, 'warning');
+            log(`[Tasks] Task ${index + 1} was not removed from the pending list after attempt ${attempt}.`, 'warning');
           } catch (error) {
             state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} failed`;
             syncTaskState();
-            log(`[Tasks] Task ${index + 1} attempt ${retry + 1} failed: ${error.message}`, 'warning');
+            log(`[Tasks] Task ${index + 1} attempt ${attempt} failed: ${error.message}`, 'warning');
           }
 
-          if (retry < config.maxRetries) {
-            const retryDelayMs = buildRetryBackoffDelayMs(TASK_RETRY_BACKOFF_MS, retry);
+          if (attempt < MAX_TASK_ATTEMPTS) {
+            const retryDelayMs = buildRetryBackoffDelayMs(TASK_RETRY_BACKOFF_MS, attempt - 1);
             log(`[Tasks] Retry backoff ${Math.round(retryDelayMs / 1000)}s before opening a fresh task tab.`, 'warning');
             await waitWithStop(retryDelayMs);
           }

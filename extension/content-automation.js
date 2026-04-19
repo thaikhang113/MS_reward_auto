@@ -1135,6 +1135,9 @@
     }
 
     const taskLinkSelectors = [
+      'mee-rewards-daily-set-item-content a[href]',
+      '.ds-card-sec a[href]',
+      '.b_cards a[href]',
       'a[href][target="_blank"][class*="cursor-pointer"]',
       'a[href*="bing.com"]',
       'a[href*="rewards.bing.com"]',
@@ -1145,6 +1148,9 @@
       'a[href*="poll"]'
     ];
     const taskCardSelectors = [
+      'mee-rewards-daily-set-item-content',
+      '.ds-card-sec',
+      '.b_cards',
       'mee-card',
       'article',
       'section',
@@ -1192,13 +1198,24 @@
         document.querySelectorAll(selector).forEach((link) => {
           if (!isVisibleElement(link)) return;
 
-          const href = link.href || '';
-          if (!isSupportedTaskLink(href)) return;
+          let sanitizedHref = link.href || '';
+          if (!sanitizedHref) return;
+
+          try {
+            const parsedUrl = new URL(sanitizedHref);
+            parsedUrl.searchParams.delete('rnoreward');
+            parsedUrl.hash = '';
+            sanitizedHref = parsedUrl.toString();
+          } catch (error) {
+            return;
+          }
+
+          if (!isSupportedTaskLink(sanitizedHref)) return;
 
           const card = findTaskCard(link);
           if (isCompletedTaskCard(card) || isCompletedTaskCard(link)) return;
 
-          const dedupKey = href.replace(/#.*$/, '');
+          const dedupKey = sanitizedHref;
           if (seen.has(dedupKey)) return;
 
           seen.add(dedupKey);

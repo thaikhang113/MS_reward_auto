@@ -52,6 +52,7 @@ export function normalizeTaskUrl(rawUrl) {
       return null;
     }
 
+    parsedUrl.searchParams.delete('rnoreward');
     parsedUrl.hash = '';
     return parsedUrl.toString();
   } catch (error) {
