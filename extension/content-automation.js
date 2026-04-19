@@ -1074,6 +1074,18 @@
       width: Math.max(320, window.innerWidth || document.documentElement.clientWidth || 1280),
       height: Math.max(320, window.innerHeight || document.documentElement.clientHeight || 720)
     });
+    const dispatchDocumentMouseDown = (clientX, clientY) => {
+      const eventInit = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX,
+        clientY
+      };
+
+      document.dispatchEvent(new MouseEvent('mousedown', eventInit));
+      document.dispatchEvent(new MouseEvent('mouseup', eventInit));
+    };
     const dispatchMouseMove = (clientX, clientY) => {
       const target = document.elementFromPoint(clientX, clientY) || document.body || document.documentElement;
       const eventInit = {
@@ -1095,27 +1107,90 @@
         const clientX = clampCoordinate(randomInt(24, viewport.width - 24), 0, viewport.width - 1);
         const clientY = clampCoordinate(randomInt(24, viewport.height - 24), 0, viewport.height - 1);
         dispatchMouseMove(clientX, clientY);
+        if (Math.random() < 0.35) {
+          dispatchDocumentMouseDown(clientX, clientY);
+        }
         await sleep(randomInt(120, 280));
       }
     };
+    const moveMouseToElement = async (element, steps = randomInt(2, 4)) => {
+      if (!element || !isVisibleElement(element)) {
+        return false;
+      }
+
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      await sleep(randomInt(500, 900));
+
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return false;
+      }
+
+      const viewport = getViewportSize();
+      for (let index = 0; index < steps; index += 1) {
+        const clientX = clampCoordinate(
+          Math.round(rect.left + randomInt(8, Math.max(8, Math.round(rect.width) - 8))),
+          0,
+          viewport.width - 1
+        );
+        const clientY = clampCoordinate(
+          Math.round(rect.top + randomInt(8, Math.max(8, Math.round(rect.height) - 8))),
+          0,
+          viewport.height - 1
+        );
+        dispatchMouseMove(clientX, clientY);
+        if (Math.random() < 0.45) {
+          dispatchDocumentMouseDown(clientX, clientY);
+        }
+        await sleep(randomInt(180, 360));
+      }
+
+      return true;
+    };
     const performHumanScrollPass = async () => {
-      const downSteps = randomInt(3, 5);
+      const downSteps = randomInt(3, 4);
 
       for (let index = 0; index < downSteps; index += 1) {
+        const distance = index % 2 === 0 ? randomInt(260, 340) : randomInt(420, 560);
         window.scrollBy({
-          top: randomInt(140, 320),
+          top: distance,
           behavior: 'smooth'
         });
-        await sleep(randomInt(700, 1300));
+        await sleep(randomInt(900, 1200));
         dismissBlockingUi();
       }
 
       window.scrollBy({
-        top: -randomInt(90, 220),
+        top: -randomInt(120, 240),
         behavior: 'smooth'
       });
       await sleep(randomInt(900, 1500));
       dismissBlockingUi();
+    };
+    const performNewsArticleReadPass = async () => {
+      const maxSteps = randomInt(5, 8);
+
+      for (let index = 0; index < maxSteps; index += 1) {
+        const scrollStep = index % 2 === 0 ? randomInt(280, 360) : randomInt(460, 620);
+        window.scrollBy({
+          top: scrollStep,
+          behavior: 'smooth'
+        });
+        if (Math.random() < 0.5) {
+          const viewport = getViewportSize();
+          dispatchDocumentMouseDown(
+            clampCoordinate(randomInt(24, viewport.width - 24), 0, viewport.width - 1),
+            clampCoordinate(randomInt(24, viewport.height - 24), 0, viewport.height - 1)
+          );
+        }
+        await sleep(randomInt(900, 1400));
+      }
+
+      window.scrollTo({
+        top: document.documentElement.scrollHeight,
+        behavior: 'smooth'
+      });
+      await sleep(randomInt(1500, 2400));
     };
     const isInternalInteractionTarget = (element) => {
       if (!element || !isVisibleElement(element) || !isInteractableElement(element)) {
@@ -1142,8 +1217,13 @@
     };
     const clickNewsStory = async () => {
       const selectors = [
+        'div[data-author] a[href]',
+        'div[data-author]',
+        '.news-card a[href]',
+        '.news-card',
         'h3 a[href]',
         'article a[href]',
+        'article',
         'a[href][class*="title" i]',
         'a[href][class*="headline" i]',
         '[data-testid*="title" i] a[href]',
@@ -1152,22 +1232,44 @@
       const candidates = dedupeElements(
         selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))
       )
+        .map((element) => element.matches?.('a[href]') ? element : (element.querySelector?.('a[href]') || element))
         .filter((element) => isInternalInteractionTarget(element))
         .sort(() => Math.random() - 0.5);
 
-      const choice = candidates[0];
+      const hoverTargets = candidates.slice(0, randomInt(3, 4));
+      for (const target of hoverTargets) {
+        await moveMouseToElement(target, randomInt(2, 3));
+        await sleep(randomInt(450, 900));
+      }
+
+      const choice = candidates[randomInt(0, Math.max(0, candidates.length - 1))];
       if (!choice) {
         return false;
       }
 
+      const beforeUrl = window.location.href;
       const label = getElementText(choice) || choice.href || 'news_item';
+      await moveMouseToElement(choice, randomInt(2, 4));
+      const rect = choice.getBoundingClientRect();
+      dispatchDocumentMouseDown(
+        clampCoordinate(Math.round(rect.left + Math.max(10, rect.width / 2)), 0, getViewportSize().width - 1),
+        clampCoordinate(Math.round(rect.top + Math.max(10, rect.height / 2)), 0, getViewportSize().height - 1)
+      );
       const clicked = await clickTaskElement(choice);
       if (!clicked) {
         return false;
       }
 
       result.clicked.push(label.substring(0, 80));
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        await sleep(500);
+        if (window.location.href !== beforeUrl || document.readyState === 'complete') {
+          break;
+        }
+      }
+
       await sleep(randomInt(1800, 3200));
+      await performNewsArticleReadPass();
       return true;
     };
     const clickRandomInternalAction = async () => {
@@ -1184,6 +1286,7 @@
         const label = getElementText(candidate);
         if (!label && candidate.tagName !== 'A') continue;
 
+        await moveMouseToElement(candidate, randomInt(2, 3));
         const clicked = await clickTaskElement(candidate);
         if (!clicked) continue;
 
@@ -1203,9 +1306,9 @@
     dismissBlockingUi();
     await sleep(randomInt(700, 1200));
 
-    // Anti-detection: them cac dau vet chuot nho de trang co nhieu su kien nhu mot phien doc that.
+    // Anti-detection: them dau vet chuot, mousedown va hover de trang nhan duoc session tuong tac day hon.
     await performHumanMousePass();
-    // Anti-detection: cuon xuong cham roi keo len mot chut nhu nguoi dang doc noi dung.
+    // Anti-detection: cuon theo kieu giat cuc, xuong tung nhom doan ngan roi keo len mot chut nhu nguoi dang doc.
     await performHumanScrollPass();
     await performHumanMousePass(randomInt(4, 7));
 

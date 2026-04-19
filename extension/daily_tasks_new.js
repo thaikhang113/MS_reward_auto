@@ -102,6 +102,16 @@ export function getTaskDedupKey(url) {
     const parsedUrl = new URL(url);
     const hostname = parsedUrl.hostname.toLowerCase();
     const path = parsedUrl.pathname.toLowerCase();
+    const normalizedSearch = [...parsedUrl.searchParams.entries()]
+      .sort(([leftKey, leftValue], [rightKey, rightValue]) => {
+        if (leftKey !== rightKey) {
+          return leftKey.localeCompare(rightKey);
+        }
+
+        return leftValue.localeCompare(rightValue);
+      })
+      .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+      .join('&');
 
     if ((hostname === 'www.bing.com' || hostname === 'bing.com') && path === '/search') {
       const query = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
@@ -110,7 +120,21 @@ export function getTaskDedupKey(url) {
       }
     }
 
-    return `${hostname}${path}${parsedUrl.search}`;
+    if (/\/news/i.test(path) || /(^|\.)msn\.com$/i.test(hostname)) {
+      const articleToken = [
+        parsedUrl.searchParams.get('id'),
+        parsedUrl.searchParams.get('url'),
+        parsedUrl.searchParams.get('ocid'),
+        parsedUrl.searchParams.get('wqid'),
+        parsedUrl.searchParams.get('wqoskey')
+      ]
+        .filter(Boolean)
+        .join('|');
+
+      return `${hostname}${path}${normalizedSearch ? `?${normalizedSearch}` : ''}${articleToken ? `::${articleToken}` : ''}`;
+    }
+
+    return `${hostname}${path}${normalizedSearch ? `?${normalizedSearch}` : ''}`;
   } catch (error) {
     return String(url || '');
   }

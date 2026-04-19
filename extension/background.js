@@ -1280,6 +1280,9 @@ async function runTaskVisit(url) {
       url,
       active: true
     });
+    try {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    } catch (error) {}
 
     await waitForTabLoad(tab.id);
     // Human-like tab focus: doi 2-3 giay sau khi load xong roi moi bat dau inject va tuong tac.
@@ -1387,6 +1390,7 @@ async function runDailyTasksAutomation() {
 
           try {
             await runTaskVisit(url);
+            await waitWithStop(5000);
             const verification = await verifyTaskCompletion(url);
             latestPendingUrls = verification.pendingUrls;
             state.tasks.pending = latestPendingUrls.length;
