@@ -37,6 +37,7 @@ const TASK_COOLDOWN_DELAY_MS = [1500, 3000];
 const TASK_RETRY_BACKOFF_MS = [5000, 11000];
 const TASK_VERIFY_SETTLE_DELAY_MS = [2500, 4500];
 const MAX_TASK_ATTEMPTS = 3;
+const TASK_INTERACTION_PASS_LIMIT = 5;
 const SUCCESS_BADGE = 'API Verified';
 const FALLBACK_BADGE = 'Fallback';
 const MAX_RUNTIME_LOGS = 200;
@@ -1014,26 +1015,45 @@ async function injectAutomationFile(tabId) {
 }
 
 async function callAutomationMethod(tabId, methodName, args = []) {
-  await injectAutomationFile(tabId);
+  if (!tabId) {
+    return null;
+  }
 
-  const executionResults = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: AUTOMATION_WORLD,
-    func: async (name, methodArgs) => {
-      const api = window.__BRA__;
-      if (!api || typeof api[name] !== 'function') {
-        return {
-          success: false,
-          error: `${name}_missing`
-        };
-      }
+  try {
+    await injectAutomationFile(tabId);
 
-      return api[name](...(Array.isArray(methodArgs) ? methodArgs : []));
-    },
-    args: [methodName, args]
-  });
+    const executionResults = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: AUTOMATION_WORLD,
+      func: async (name, methodArgs) => {
+        const api = window.__BRA__;
+        if (!api || typeof api[name] !== 'function') {
+          return {
+            success: false,
+            error: `${name}_missing`
+          };
+        }
 
-  return executionResults?.[0]?.result || null;
+        return api[name](...(Array.isArray(methodArgs) ? methodArgs : []));
+      },
+      args: [methodName, args]
+    });
+
+    return executionResults?.[0]?.result || null;
+  } catch (error) {
+    const message = String(error?.message || error || '');
+
+    if (/Frame with ID 0|frame .* was removed|No frame with id 0/i.test(message)) {
+      log(`[Automation] ${methodName} interrupted because the main frame was replaced. Will retry on the refreshed page.`, 'warning');
+      return {
+        success: false,
+        error: 'frame_removed',
+        retryable: true
+      };
+    }
+
+    throw error;
+  }
 }
 
 async function setMobileMode(enabled) {
@@ -1288,7 +1308,25 @@ async function runTaskVisit(url) {
     // Human-like tab focus: doi 2-3 giay sau khi load xong roi moi bat dau inject va tuong tac.
     await waitWithStop(randomInt(2000, 3000));
 
-    const taskResult = await callAutomationMethod(tab.id, 'runTaskPageInteraction', [{ mobile: false }]);
+    let taskResult = null;
+
+    for (let pass = 1; pass <= TASK_INTERACTION_PASS_LIMIT; pass += 1) {
+      taskResult = await callAutomationMethod(tab.id, 'runTaskPageInteraction', [{ mobile: false }]);
+
+      if (taskResult?.success) {
+        break;
+      }
+
+      if (taskResult?.retryable) {
+        log(`[Tasks] Re-syncing task tab after frame reset (pass ${pass}/${TASK_INTERACTION_PASS_LIMIT}).`, 'warning');
+        await waitForTabLoad(tab.id);
+        await waitWithStop(randomInt(1800, 2800));
+        continue;
+      }
+
+      throw new Error(taskResult?.error || 'runTaskPageInteraction failed');
+    }
+
     if (!taskResult?.success) {
       throw new Error(taskResult?.error || 'runTaskPageInteraction failed');
     }
@@ -1306,6 +1344,7 @@ async function runTaskVisit(url) {
   } finally {
     if (tab?.id) {
       await closeTab(tab.id);
+      await waitWithStop(10000);
     }
   }
 }
@@ -1390,7 +1429,6 @@ async function runDailyTasksAutomation() {
 
           try {
             await runTaskVisit(url);
-            await waitWithStop(5000);
             const verification = await verifyTaskCompletion(url);
             latestPendingUrls = verification.pendingUrls;
             state.tasks.pending = latestPendingUrls.length;

@@ -78,6 +78,14 @@ export function normalizeTaskUrl(rawUrl) {
     }
 
     parsedUrl.searchParams.delete('rnoreward');
+    if (parsedUrl.searchParams.has('checkin')) {
+      const checkinValue = String(parsedUrl.searchParams.get('checkin') || '').trim().toLowerCase();
+      if (!checkinValue || /^(false|0|no)$/i.test(checkinValue)) {
+        parsedUrl.searchParams.delete('checkin');
+      } else {
+        parsedUrl.searchParams.set('checkin', '1');
+      }
+    }
 
     if (
       /(^|\.)bing\.com$/i.test(hostname)

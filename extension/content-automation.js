@@ -1068,12 +1068,56 @@
       started: false,
       completed: false
     };
+    const createRetryableResult = (stage, extra = {}) => ({
+      ...result,
+      ...extra,
+      success: false,
+      retryable: true,
+      error: stage,
+      stage
+    });
+    const NEWS_FLOW_KEY = '__BRA_NEWS_FLOW__';
     const supportedInternalHostRe = /(^|\.)bing\.com$|(^|\.)msn\.com$|(^|\.)microsoft\.com$/i;
     const clampCoordinate = (value, min, max) => Math.min(Math.max(value, min), max);
     const getViewportSize = () => ({
       width: Math.max(320, window.innerWidth || document.documentElement.clientWidth || 1280),
       height: Math.max(320, window.innerHeight || document.documentElement.clientHeight || 720)
     });
+    const ensureVisiblePageState = () => {
+      if (window.__BRA_VISIBILITY_PATCHED__) {
+        return;
+      }
+
+      window.__BRA_VISIBILITY_PATCHED__ = true;
+      const documentPrototype = Object.getPrototypeOf(document);
+
+      overrideValue(document, 'visibilityState', 'visible')
+        || overrideValue(documentPrototype, 'visibilityState', 'visible');
+      overrideValue(document, 'hidden', false)
+        || overrideValue(documentPrototype, 'hidden', false);
+      overrideValue(document, 'webkitHidden', false)
+        || overrideValue(documentPrototype, 'webkitHidden', false);
+      overrideGetter(document, 'hasFocus', () => () => true)
+        || overrideGetter(documentPrototype, 'hasFocus', () => () => true);
+    };
+    const getNewsFlowState = () => {
+      try {
+        const raw = window.sessionStorage.getItem(NEWS_FLOW_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (error) {
+        return null;
+      }
+    };
+    const setNewsFlowState = (nextState) => {
+      try {
+        window.sessionStorage.setItem(NEWS_FLOW_KEY, JSON.stringify(nextState));
+      } catch (error) {}
+    };
+    const clearNewsFlowState = () => {
+      try {
+        window.sessionStorage.removeItem(NEWS_FLOW_KEY);
+      } catch (error) {}
+    };
     const dispatchDocumentMouseDown = (clientX, clientY) => {
       const eventInit = {
         bubbles: true,
@@ -1148,15 +1192,18 @@
       return true;
     };
     const performHumanScrollPass = async () => {
-      const downSteps = randomInt(3, 4);
+      const scrollPattern = [
+        { distance: 400, pauseMin: 1800, pauseMax: 2200 },
+        { distance: 600, pauseMin: 1300, pauseMax: 1700 },
+        { distance: 320, pauseMin: 1100, pauseMax: 1500 }
+      ];
 
-      for (let index = 0; index < downSteps; index += 1) {
-        const distance = index % 2 === 0 ? randomInt(260, 340) : randomInt(420, 560);
+      for (const step of scrollPattern) {
         window.scrollBy({
-          top: distance,
+          top: step.distance,
           behavior: 'smooth'
         });
-        await sleep(randomInt(900, 1200));
+        await sleep(randomInt(step.pauseMin, step.pauseMax));
         dismissBlockingUi();
       }
 
@@ -1168,10 +1215,14 @@
       dismissBlockingUi();
     };
     const performNewsArticleReadPass = async () => {
-      const maxSteps = randomInt(5, 8);
+      const articleTarget = Math.max(
+        Math.floor((document.documentElement.scrollHeight - window.innerHeight) * 0.5),
+        0
+      );
 
-      for (let index = 0; index < maxSteps; index += 1) {
-        const scrollStep = index % 2 === 0 ? randomInt(280, 360) : randomInt(460, 620);
+      while (window.scrollY < articleTarget) {
+        const remaining = articleTarget - window.scrollY;
+        const scrollStep = remaining > 700 ? 600 : (remaining > 450 ? 400 : remaining);
         window.scrollBy({
           top: scrollStep,
           behavior: 'smooth'
@@ -1183,14 +1234,8 @@
             clampCoordinate(randomInt(24, viewport.height - 24), 0, viewport.height - 1)
           );
         }
-        await sleep(randomInt(900, 1400));
+        await sleep(scrollStep >= 600 ? randomInt(1400, 1700) : randomInt(1800, 2200));
       }
-
-      window.scrollTo({
-        top: document.documentElement.scrollHeight,
-        behavior: 'smooth'
-      });
-      await sleep(randomInt(1500, 2400));
     };
     const isInternalInteractionTarget = (element) => {
       if (!element || !isVisibleElement(element) || !isInteractableElement(element)) {
@@ -1215,8 +1260,8 @@
 
       return true;
     };
-    const clickNewsStory = async () => {
-      const selectors = [
+    const getNewsCandidates = () => dedupeElements(
+      [
         'div[data-author] a[href]',
         'div[data-author]',
         '.news-card a[href]',
@@ -1228,27 +1273,63 @@
         'a[href][class*="headline" i]',
         '[data-testid*="title" i] a[href]',
         'main a[href]'
+      ].flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+    )
+      .map((element) => element.matches?.('a[href]') ? element : (element.querySelector?.('a[href]') || element))
+      .filter((element) => isInternalInteractionTarget(element));
+    const clickNewsStory = async () => {
+      const flowState = getNewsFlowState();
+      const candidates = getNewsCandidates()
+        .sort(() => Math.random() - 0.5);
+      const isListingPage = candidates.length >= 2;
+
+      if (!isListingPage && flowState?.visited?.length) {
+        await performHumanMousePass(randomInt(4, 6));
+        await performNewsArticleReadPass();
+
+        if (flowState.visited.length < 2 && window.history.length > 1 && !flowState.returnedOnce) {
+          setNewsFlowState({
+            ...flowState,
+            stage: 'returning',
+            returnedOnce: true
+          });
+          window.history.back();
+          await sleep(250);
+          return createRetryableResult('news_returning_to_listing');
+        } else {
+          clearNewsFlowState();
+        }
+
+        result.completed = true;
+        return true;
+      }
+
+      const selectors = [
+        'div[data-author] a[href]',
+        '.news-card a[href]',
+        'h3 a[href]',
+        'article a[href]'
       ];
-      const candidates = dedupeElements(
+      const hoverCandidates = dedupeElements(
         selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)))
       )
-        .map((element) => element.matches?.('a[href]') ? element : (element.querySelector?.('a[href]') || element))
         .filter((element) => isInternalInteractionTarget(element))
         .sort(() => Math.random() - 0.5);
-
-      const hoverTargets = candidates.slice(0, randomInt(3, 4));
+      const hoverTargets = hoverCandidates.slice(0, randomInt(3, Math.min(4, Math.max(3, hoverCandidates.length))));
       for (const target of hoverTargets) {
         await moveMouseToElement(target, randomInt(2, 3));
         await sleep(randomInt(450, 900));
       }
 
-      const choice = candidates[randomInt(0, Math.max(0, candidates.length - 1))];
+      const visited = new Set(flowState?.visited || []);
+      const choice = candidates.find((candidate) => !visited.has(candidate.href)) || candidates[0];
       if (!choice) {
         return false;
       }
 
       const beforeUrl = window.location.href;
       const label = getElementText(choice) || choice.href || 'news_item';
+      const nextVisited = [...visited, choice.href];
       await moveMouseToElement(choice, randomInt(2, 4));
       const rect = choice.getBoundingClientRect();
       dispatchDocumentMouseDown(
@@ -1260,6 +1341,11 @@
         return false;
       }
 
+      setNewsFlowState({
+        stage: 'opened',
+        visited: nextVisited,
+        returnedOnce: Boolean(flowState?.returnedOnce)
+      });
       result.clicked.push(label.substring(0, 80));
       for (let attempt = 0; attempt < 8; attempt += 1) {
         await sleep(500);
@@ -1268,9 +1354,12 @@
         }
       }
 
-      await sleep(randomInt(1800, 3200));
-      await performNewsArticleReadPass();
-      return true;
+      if (window.location.href === beforeUrl && choice.href && choice.href !== beforeUrl) {
+        window.location.assign(choice.href);
+        await sleep(250);
+      }
+
+      return createRetryableResult('news_opened_article');
     };
     const clickRandomInternalAction = async () => {
       const candidates = dedupeElements([
@@ -1305,6 +1394,7 @@
 
     dismissBlockingUi();
     await sleep(randomInt(700, 1200));
+    ensureVisiblePageState();
 
     // Anti-detection: them dau vet chuot, mousedown va hover de trang nhan duoc session tuong tac day hon.
     await performHumanMousePass();
@@ -1330,11 +1420,14 @@
 
     if (/news/i.test(window.location.href)) {
       result.mode = 'news';
-      const openedNews = await clickNewsStory();
-      if (!openedNews) {
+      const newsOutcome = await clickNewsStory();
+      if (newsOutcome && typeof newsOutcome === 'object' && newsOutcome.retryable) {
+        return newsOutcome;
+      }
+      if (!newsOutcome) {
         await clickRandomInternalAction();
       }
-      result.completed = openedNews || isTaskCompleted();
+      result.completed = newsOutcome || isTaskCompleted();
       return result;
     }
 
