@@ -1,5 +1,6 @@
 import { fetchPendingDailyTaskUrls, getTaskDedupKey, normalizeTaskUrl } from './daily_tasks_new.js';
 import { getAllKeywords } from './keywords-data.js';
+import { getDashboardFromPayload, normalizeRewardsCounter } from './rewards_dashboard.js';
 
 const DEFAULT_CONFIG = Object.freeze({
   rewardsLevel: 'gold',
@@ -736,30 +737,13 @@ async function fetchRewardsDashboardViaTab() {
   }
 }
 
-function normalizeCounter(key, value) {
-  if (!value || typeof value !== 'object') return null;
-
-  const progress = toFiniteNumber(value.pointProgress);
-  const max = toFiniteNumber(value.pointProgressMax);
-  if (!Number.isFinite(max) || max <= 0) return null;
-
-  const safeProgress = Number.isFinite(progress) ? progress : 0;
-  return {
-    key,
-    progress: safeProgress,
-    max,
-    remaining: Math.max(0, max - safeProgress),
-    complete: value.complete === true || safeProgress >= max
-  };
-}
-
 function getCountersSnapshot(dashboard) {
   const counters = dashboard?.userStatus?.counters;
   if (!counters || typeof counters !== 'object') return {};
 
   const snapshot = {};
   for (const [key, value] of Object.entries(counters)) {
-    const normalized = normalizeCounter(key, value);
+    const normalized = normalizeRewardsCounter(key, value);
     if (normalized) {
       snapshot[key] = normalized;
     }
@@ -840,13 +824,16 @@ async function fetchRewardsDashboard(options = {}) {
 
   try {
     payload = await fetchJsonWithTimeout(REWARDS_API_URL);
+    if (!getDashboardFromPayload(payload)) {
+      throw new Error('Background fetch returned a non-dashboard payload');
+    }
   } catch (error) {
     source = 'tab_fallback';
     payload = await fetchRewardsDashboardViaTab();
   }
 
-  const dashboard = payload?.dashboard || payload;
-  if (!dashboard || typeof dashboard !== 'object') {
+  const dashboard = getDashboardFromPayload(payload);
+  if (!dashboard) {
     throw new Error('Invalid rewards dashboard payload');
   }
 
