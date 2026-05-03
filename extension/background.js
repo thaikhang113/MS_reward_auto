@@ -681,7 +681,20 @@ async function fetchRewardsDashboardViaTab(options = {}) {
       purpose: closeAfter ? 'generic' : 'dashboard'
     });
 
+    if (active && tab.windowId) {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch (error) {}
+    }
+
     await waitForTabLoad(tab.id);
+
+    if (active && tab.windowId) {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch (error) {}
+    }
+
     await waitWithStop(settleMs);
 
     const results = await chrome.scripting.executeScript({
@@ -942,9 +955,9 @@ async function fetchRewardsDashboard(options = {}) {
   const dashboard = getDashboardFromPayload(payload);
   if (!dashboard) {
     source = 'dashboard_recovery';
-    log('[API] Dashboard payload invalid; reusing one background Rewards Dashboard tab for recovery.', 'warning');
+    log('[API] Dashboard payload invalid; reusing one focused Rewards Dashboard tab for recovery.', 'warning');
     payload = await fetchRewardsDashboardViaTab({
-      active: false,
+      active: true,
       closeAfter: false,
       settleMs: 4500
     });
@@ -952,7 +965,7 @@ async function fetchRewardsDashboard(options = {}) {
 
   const recoveredDashboard = getDashboardFromPayload(payload);
   if (!recoveredDashboard) {
-    throw new Error('Invalid rewards dashboard payload. Rewards Dashboard recovery tab was opened in background; sign in there, then run again.');
+    throw new Error('Invalid rewards dashboard payload. Rewards Dashboard recovery tab was opened focused; sign in there, then run again.');
   }
 
   const snapshot = createDashboardSnapshot(recoveredDashboard, source);

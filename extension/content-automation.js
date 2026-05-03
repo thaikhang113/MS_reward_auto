@@ -373,40 +373,81 @@
     }
   }
 
-  function submitSearch(searchInput, options = {}) {
+  function buildSearchNavigationUrl(keyword) {
+    const url = new URL('/search', window.location.origin || 'https://www.bing.com');
+    url.searchParams.set('q', keyword);
+    return url.toString();
+  }
+
+  function isSearchResultsPage(keyword) {
+    try {
+      const url = new URL(window.location.href);
+      const query = (url.searchParams.get('q') || '').trim().toLowerCase();
+      const expected = String(keyword || '').trim().toLowerCase();
+      return /\/search/i.test(url.pathname) && (!expected || query === expected);
+    } catch (error) {
+      return Boolean(document.querySelector('#b_results, main [data-bm]'));
+    }
+  }
+
+  async function waitForSearchNavigation(keyword, startedUrl) {
+    const deadline = Date.now() + 3500;
+
+    while (Date.now() < deadline) {
+      if (window.location.href !== startedUrl && isSearchResultsPage(keyword)) {
+        return true;
+      }
+
+      if (isSearchResultsPage(keyword)) {
+        return true;
+      }
+
+      await sleep(180);
+    }
+
+    return false;
+  }
+
+  function dispatchEnterSearch(searchInput) {
+    const eventInit = {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true
+    };
+
+    searchInput.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+    searchInput.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+    searchInput.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+  }
+
+  function submitSearch(searchInput) {
     const form = searchInput.closest('form') || document.getElementById('sb_form');
     const submitButton = form?.querySelector('button[type="submit"], input[type="submit"], [aria-label*="Search" i]');
 
-    if (options.mobile && submitButton) {
+    dispatchEnterSearch(searchInput);
+
+    if (submitButton) {
       submitButton.click();
-      return;
     }
 
     if (form?.requestSubmit) {
-      form.requestSubmit();
-      return;
+      try {
+        form.requestSubmit();
+      } catch (error) {}
+    } else if (form) {
+      try {
+        form.submit();
+      } catch (error) {}
     }
 
-    if (form) {
-      form.submit();
-      return;
-    }
-
-    searchInput.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Enter',
-      keyCode: 13,
-      which: 13,
-      bubbles: true
-    }));
-    searchInput.dispatchEvent(new KeyboardEvent('keyup', {
-      key: 'Enter',
-      keyCode: 13,
-      which: 13,
-      bubbles: true
-    }));
+    dispatchEnterSearch(searchInput);
   }
 
   async function typeAndSearch(keyword, options = {}) {
+    const startedUrl = window.location.href;
     window.scrollTo(0, 0);
 
     if (options.mobile) {
@@ -420,9 +461,7 @@
 
     if (!searchInput) {
       if (options.mobile) {
-        const directUrl = new URL('/search', window.location.origin);
-        directUrl.searchParams.set('q', keyword);
-        window.location.href = directUrl.toString();
+        window.location.assign(buildSearchNavigationUrl(keyword));
         return { success: true, fallback: 'url_navigation' };
       }
 
@@ -442,8 +481,14 @@
     await humanTypeString(searchInput, keyword, options.mobile ? 'fast' : 'medium');
     await sleep(randomInt(600, 1500));
 
-    submitSearch(searchInput, options);
-    return { success: true };
+    submitSearch(searchInput);
+
+    if (!await waitForSearchNavigation(keyword, startedUrl)) {
+      window.location.assign(buildSearchNavigationUrl(keyword));
+      return { success: true, fallback: 'forced_url_navigation' };
+    }
+
+    return { success: true, submitted: true };
   }
 
   async function enhancedSearchInteraction(options = {}) {
