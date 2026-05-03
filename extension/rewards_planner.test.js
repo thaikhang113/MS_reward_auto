@@ -84,3 +84,22 @@ test('automation planner can disable dashboard tasks while keeping search worker
   assert.equal(plan.pc.count, 30);
   assert.equal(hasAutomationWork(plan), true);
 });
+
+test('automation planner does not run searches blindly when counters are missing', () => {
+  const plan = buildAutomationPlan(
+    {
+      mobileMode: true,
+      mobileSearchCount: 30,
+      searchCount: 30
+    },
+    {
+      pendingTaskUrls: []
+    }
+  );
+
+  assert.equal(plan.mobile.count, 0);
+  assert.equal(plan.mobile.reason, 'no_counter');
+  assert.equal(plan.pc.count, 0);
+  assert.equal(plan.pc.reason, 'no_counter');
+  assert.equal(hasAutomationWork(plan), false);
+});

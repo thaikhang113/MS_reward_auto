@@ -727,6 +727,86 @@ async function fetchRewardsDashboardViaTab(options = {}) {
           );
         };
 
+        const extractBalancedObjectLiteral = (text, startIndex) => {
+          let depth = 0;
+          let inString = false;
+          let stringQuote = '';
+          let escaped = false;
+          let objectStart = -1;
+
+          for (let index = startIndex; index < text.length; index += 1) {
+            const char = text[index];
+
+            if (inString) {
+              if (escaped) {
+                escaped = false;
+              } else if (char === '\\') {
+                escaped = true;
+              } else if (char === stringQuote) {
+                inString = false;
+              }
+              continue;
+            }
+
+            if (char === '"' || char === "'") {
+              inString = true;
+              stringQuote = char;
+              continue;
+            }
+
+            if (char === '{') {
+              if (objectStart === -1) objectStart = index;
+              depth += 1;
+              continue;
+            }
+
+            if (char === '}') {
+              depth -= 1;
+              if (depth === 0 && objectStart !== -1) {
+                return text.slice(objectStart, index + 1);
+              }
+            }
+          }
+
+          return null;
+        };
+
+        const parseDashboardFromText = (text) => {
+          if (typeof text !== 'string' || !text.trim()) return null;
+
+          const patterns = [
+            /(?:var|let|const)\s+dashboard\s*=/gi,
+            /"dashboard"\s*:\s*/gi
+          ];
+
+          for (const pattern of patterns) {
+            pattern.lastIndex = 0;
+            let match = pattern.exec(text);
+            while (match) {
+              const literal = extractBalancedObjectLiteral(text, pattern.lastIndex);
+              if (literal) {
+                try {
+                  const payload = JSON.parse(literal);
+                  if (isDashboardPayload(payload)) {
+                    return payload?.dashboard || payload;
+                  }
+                } catch (error) {}
+              }
+              match = pattern.exec(text);
+            }
+          }
+
+          return null;
+        };
+
+        const readDashboardFromPage = () => {
+          const scriptText = Array.from(document.scripts || [])
+            .map((script) => script.textContent || '')
+            .join('\n');
+          return parseDashboardFromText(scriptText)
+            || parseDashboardFromText(document.documentElement?.outerHTML || '');
+        };
+
         const scrapeVisiblePoints = () => {
           const text = document.body?.innerText || '';
           const match = text.match(/Available points\s+([\d,.\s]+)/i);
@@ -745,6 +825,11 @@ async function fetchRewardsDashboardViaTab(options = {}) {
         });
 
         if (!response.ok) {
+          const pageDashboard = readDashboardFromPage();
+          if (pageDashboard) {
+            return pageDashboard;
+          }
+
           const visiblePoints = scrapeVisiblePoints();
           if (Number.isFinite(visiblePoints)) {
             return buildVisiblePointsDashboard(visiblePoints);
@@ -759,6 +844,11 @@ async function fetchRewardsDashboardViaTab(options = {}) {
             return payload;
           }
 
+          const pageDashboard = readDashboardFromPage();
+          if (pageDashboard) {
+            return pageDashboard;
+          }
+
           const visiblePoints = scrapeVisiblePoints();
           if (Number.isFinite(visiblePoints)) {
             return buildVisiblePointsDashboard(visiblePoints);
@@ -766,6 +856,11 @@ async function fetchRewardsDashboardViaTab(options = {}) {
 
           return payload;
         } catch (error) {
+          const pageDashboard = readDashboardFromPage();
+          if (pageDashboard) {
+            return pageDashboard;
+          }
+
           const visiblePoints = scrapeVisiblePoints();
           if (Number.isFinite(visiblePoints)) {
             return buildVisiblePointsDashboard(visiblePoints);
@@ -1485,12 +1580,14 @@ function syncTaskState() {
 }
 
 function logAutomationPlan(plan, context = 'Run') {
-  const mobileText = plan.mobile.reason === 'complete'
-    ? 'complete'
-    : `${plan.mobile.count}${plan.mobile.remaining !== null ? `/${plan.mobile.remaining}` : ''}`;
-  const pcText = plan.pc.reason === 'complete'
-    ? 'complete'
-    : `${plan.pc.count}${plan.pc.remaining !== null ? `/${plan.pc.remaining}` : ''}`;
+  const formatBranch = (branch) => {
+    if (branch.reason === 'complete') return 'complete';
+    if (branch.reason === 'disabled') return 'disabled';
+    if (branch.reason === 'no_counter') return 'no counter';
+    return `${branch.count}${branch.remaining !== null ? `/${branch.remaining}` : ''}`;
+  };
+  const mobileText = formatBranch(plan.mobile);
+  const pcText = formatBranch(plan.pc);
 
   log(`[${context}] Plan: tasks ${plan.tasks.count}, mobile ${mobileText}, PC ${pcText}.`);
 }

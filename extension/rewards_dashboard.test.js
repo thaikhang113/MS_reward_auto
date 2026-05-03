@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 
 import {
   getDashboardFromPayload,
-  normalizeRewardsCounter
+  normalizeRewardsCounter,
+  parseRewardsDashboardFromHtml
 } from './rewards_dashboard.js';
 
 test('getDashboardFromPayload accepts wrapped and direct dashboard objects', () => {
@@ -35,5 +36,25 @@ test('normalizeRewardsCounter reads Rewards API array attributes counters', () =
     max: 60,
     remaining: 51,
     complete: false
+  });
+});
+
+test('parseRewardsDashboardFromHtml extracts dashboard variable with counters', () => {
+  const html = `
+    <script>
+      var dashboard = {"userStatus":{"availablePoints":2338,"counters":{"mobileSearch":[{"pointProgress":60,"pointProgressMax":60}]}}};
+    </script>
+  `;
+
+  assert.deepEqual(parseRewardsDashboardFromHtml(html), {
+    userStatus: {
+      availablePoints: 2338,
+      counters: {
+        mobileSearch: [{
+          pointProgress: 60,
+          pointProgressMax: 60
+        }]
+      }
+    }
   });
 });

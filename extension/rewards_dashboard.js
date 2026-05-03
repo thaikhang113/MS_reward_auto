@@ -17,6 +17,78 @@ export function getDashboardFromPayload(payload) {
   return dashboard;
 }
 
+function extractBalancedObjectLiteral(text, startIndex) {
+  let depth = 0;
+  let inString = false;
+  let stringQuote = '';
+  let escaped = false;
+  let objectStart = -1;
+
+  for (let index = startIndex; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      inString = true;
+      stringQuote = char;
+      continue;
+    }
+
+    if (char === '{') {
+      if (objectStart === -1) objectStart = index;
+      depth += 1;
+      continue;
+    }
+
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0 && objectStart !== -1) {
+        return text.slice(objectStart, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+export function parseRewardsDashboardFromHtml(html) {
+  if (typeof html !== 'string' || !html.trim()) return null;
+
+  const patterns = [
+    /(?:var|let|const)\s+dashboard\s*=/gi,
+    /"dashboard"\s*:\s*/gi
+  ];
+
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    let match = pattern.exec(html);
+    while (match) {
+      const literal = extractBalancedObjectLiteral(html, pattern.lastIndex);
+      if (literal) {
+        try {
+          const parsed = JSON.parse(literal);
+          const dashboard = getDashboardFromPayload(parsed);
+          if (dashboard) return dashboard;
+        } catch (error) {}
+      }
+
+      match = pattern.exec(html);
+    }
+  }
+
+  return null;
+}
+
 export function normalizeRewardsCounter(key, value) {
   const source = Array.isArray(value) ? value[0] : value;
   if (!source || typeof source !== 'object') return null;

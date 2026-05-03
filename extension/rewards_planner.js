@@ -40,6 +40,14 @@ function buildSearchBranch(configuredCount, counter, enabled = true) {
   }
 
   const remaining = getRemainingSearchCountFromCounter(counter);
+  if (remaining === null) {
+    return {
+      count: 0,
+      remaining,
+      reason: 'no_counter'
+    };
+  }
+
   if (remaining === 0) {
     return {
       count: 0,

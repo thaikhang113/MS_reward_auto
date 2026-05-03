@@ -44,6 +44,14 @@ test('search start uses automation planner to skip completed workers', () => {
   assert.match(source, /scanUncompletedTasks\(dashboard\)/);
 });
 
+test('dashboard recovery extracts counters from page html before points-only fallback', () => {
+  assert.match(source, /const readDashboardFromPage = \(\) => \{/);
+  assert.match(source, /parseDashboardFromText\(scriptText\)/);
+  assert.match(source, /const pageDashboard = readDashboardFromPage\(\)/);
+  assert.match(source, /if \(pageDashboard\) \{\s*return pageDashboard;\s*\}/s);
+  assert.match(source, /buildVisiblePointsDashboard\(visiblePoints\)/);
+});
+
 test('focused dashboard recovery is opt-in only', () => {
   assert.match(source, /allowFocusedRecovery = false/);
   assert.match(source, /if \(allowFocusedRecovery\) \{/);
