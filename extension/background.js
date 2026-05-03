@@ -998,13 +998,18 @@ async function fetchRewardsDashboard(options = {}) {
         settleMs: 4500
       });
     } else {
-      log('[API] Background-only Rewards Dashboard recovery failed; not focusing dashboard tab.', 'warning');
+      log('[API] Dashboard payload invalid; reusing one background Rewards Dashboard tab for recovery.', 'warning');
+      payload = await fetchRewardsDashboardViaTab({
+        active: false,
+        closeAfter: false,
+        settleMs: 4500
+      });
     }
   }
 
   const recoveredDashboard = getDashboardFromPayload(payload);
   if (!recoveredDashboard) {
-    throw new Error('Invalid rewards dashboard payload. Background-only Rewards Dashboard recovery failed; sign in to Rewards in Edge, then run again.');
+    throw new Error('Invalid rewards dashboard payload. Background Rewards Dashboard recovery failed; keep one Rewards dashboard tab signed in, then run again.');
   }
 
   const snapshot = createDashboardSnapshot(recoveredDashboard, source);

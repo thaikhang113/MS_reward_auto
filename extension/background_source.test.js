@@ -34,5 +34,7 @@ test('auto resume checks remaining search work without focused dashboard recover
 test('focused dashboard recovery is opt-in only', () => {
   assert.match(source, /allowFocusedRecovery = false/);
   assert.match(source, /if \(allowFocusedRecovery\) \{/);
-  assert.match(source, /Background-only Rewards Dashboard recovery failed/);
+  assert.match(source, /fetchRewardsDashboardViaTab\(\{\s*active:\s*false,\s*closeAfter:\s*false,\s*settleMs:\s*4500/s);
+  assert.match(source, /reusing one background Rewards Dashboard tab for recovery/);
+  assert.match(source, /Background Rewards Dashboard recovery failed/);
 });
