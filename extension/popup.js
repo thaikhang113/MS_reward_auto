@@ -308,17 +308,18 @@ function loadConfig(config) {
 function getConfigFromUI() {
   const speedLevel = parseInt(DOM.cfgSpeed.value, 10) || 3;
   const speed = SPEED_LEVELS[speedLevel];
+  const mobileSearchCount = parseInt(DOM.cfgMobileSearch.value, 10);
 
   return {
     rewardsLevel: DOM.cfgLevel.value,
-    searchCount: parseInt(DOM.cfgSearch.value, 10) || 12,
+    searchCount: parseInt(DOM.cfgSearch.value, 10) || 30,
     speedLevel,
     minDelay: speed.minDelay,
     maxDelay: speed.maxDelay,
     waveSize: speed.waveSize,
     wavePauseMin: speed.wavePause,
     mobileMode: DOM.cfgMobile.checked,
-    mobileSearchCount: parseInt(DOM.cfgMobileSearch.value, 10) || 0
+    mobileSearchCount: Number.isFinite(mobileSearchCount) ? mobileSearchCount : 30
   };
 }
 

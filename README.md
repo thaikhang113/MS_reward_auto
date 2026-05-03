@@ -4,8 +4,8 @@ Chrome/Edge extension tu dong chay Microsoft Rewards searches va daily tasks.
 
 ## Tinh nang
 
-- PC search va mobile search.
-- Mobile search gia lap bang UA rules, touch/viewport mobile trong content script.
+- PC search va mobile search mac dinh 30/30.
+- Mobile search chay truoc trong mot Edge window rieng, focused, kich thuoc mobile; ket hop UA rules va touch/viewport mobile trong content script.
 - Lay keyword chinh tu Google Trends Viet Nam; thu RPC truoc, fallback sang tab Google Trends, roi den RSS neu browser/Google tra loi rong hoac reject request.
 - Neu Rewards API tra payload loi, extension tu mo/reuse Rewards Dashboard de recovery.
 - Gioi han tab extension quan ly toi da 2 tab, tab moi tao o background (`active: false`) de khong cuop focus khi ban dang lam viec.

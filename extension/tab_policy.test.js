@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  MOBILE_SEARCH_WINDOW_BOUNDS,
   MAX_EXTENSION_OPEN_TABS,
+  buildMobileSearchWindowOptions,
   isRewardsDashboardTab,
   pickReusableRewardsDashboardTab,
   planManagedTabOpen
@@ -64,4 +66,25 @@ test('planManagedTabOpen preserves recovery dashboard before creating a new tab'
     }),
     { action: 'create', closeTabIds: [11, 12] }
   );
+});
+
+test('buildMobileSearchWindowOptions creates a focused mobile-sized Edge window', () => {
+  assert.deepEqual(
+    buildMobileSearchWindowOptions('https://www.bing.com/'),
+    {
+      url: 'https://www.bing.com/',
+      type: 'normal',
+      focused: true,
+      width: MOBILE_SEARCH_WINDOW_BOUNDS.width,
+      height: MOBILE_SEARCH_WINDOW_BOUNDS.height,
+      left: MOBILE_SEARCH_WINDOW_BOUNDS.left,
+      top: MOBILE_SEARCH_WINDOW_BOUNDS.top
+    }
+  );
+  assert.deepEqual(MOBILE_SEARCH_WINDOW_BOUNDS, {
+    width: 430,
+    height: 930,
+    left: 40,
+    top: 20
+  });
 });

@@ -2,19 +2,20 @@ import { fetchPendingDailyTaskUrls, getTaskDedupKey, normalizeTaskUrl } from './
 import { getAllKeywords } from './keywords-data.js';
 import { getDashboardFromPayload, normalizeRewardsCounter } from './rewards_dashboard.js';
 import { shouldAcceptUnconfirmedSearch } from './search_verification.js';
-import { planManagedTabOpen } from './tab_policy.js';
+import { buildMobileSearchWindowOptions, planManagedTabOpen } from './tab_policy.js';
 
 const DEFAULT_CONFIG = Object.freeze({
   rewardsLevel: 'gold',
-  searchCount: 12,
-  mobileSearchCount: 5,
+  searchCount: 30,
+  mobileSearchCount: 30,
   minDelay: 20,
   maxDelay: 40,
-  mobileMode: false,
+  mobileMode: true,
   maxRetries: 2,
   waveSize: 4,
   wavePauseMin: 15,
-  speedLevel: 3
+  speedLevel: 3,
+  mobileWindowModeVersion: 1
 });
 
 const BING_HOME_URL = 'https://www.bing.com/';
@@ -150,6 +151,7 @@ let persistInFlight = null;
 let persistDirty = false;
 let rewardsDashboardRecoveryTabId = null;
 const managedTabIds = new Set();
+const managedWindowIds = new Set();
 
 function getPublicState() {
   return JSON.parse(JSON.stringify(state));
@@ -1064,13 +1066,25 @@ function sanitizeConfig(input = {}) {
   merged.waveSize = clamp(parseInt(merged.waveSize, 10) || DEFAULT_CONFIG.waveSize, 0, 20);
   merged.wavePauseMin = clamp(parseInt(merged.wavePauseMin, 10) || DEFAULT_CONFIG.wavePauseMin, 0, 120);
   merged.speedLevel = clamp(parseInt(merged.speedLevel, 10) || DEFAULT_CONFIG.speedLevel, 1, 6);
+  merged.mobileWindowModeVersion = DEFAULT_CONFIG.mobileWindowModeVersion;
 
   return merged;
 }
 
 async function getConfig() {
-  const result = await chrome.storage.local.get('config');
-  return sanitizeConfig(result.config || {});
+  const runtimeStorage = chrome.storage.local;
+  const result = await runtimeStorage.get('config');
+  const savedConfig = result.config || {};
+  const config = sanitizeConfig(savedConfig);
+
+  if (savedConfig.mobileWindowModeVersion !== DEFAULT_CONFIG.mobileWindowModeVersion) {
+    config.searchCount = DEFAULT_CONFIG.searchCount;
+    config.mobileSearchCount = DEFAULT_CONFIG.mobileSearchCount;
+    config.mobileMode = DEFAULT_CONFIG.mobileMode;
+    await runtimeStorage.set({ config });
+  }
+
+  return config;
 }
 
 async function saveConfig(config) {
@@ -1208,6 +1222,28 @@ async function closeTab(tabId) {
   } catch (error) {}
 }
 
+async function closeWindow(windowId) {
+  if (!Number.isInteger(windowId)) return;
+
+  managedWindowIds.delete(windowId);
+
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    for (const tab of tabs) {
+      if (Number.isInteger(tab.id)) {
+        managedTabIds.delete(tab.id);
+        if (tab.id === rewardsDashboardRecoveryTabId) {
+          rewardsDashboardRecoveryTabId = null;
+        }
+      }
+    }
+  } catch (error) {}
+
+  try {
+    await chrome.windows.remove(windowId);
+  } catch (error) {}
+}
+
 async function openManagedTab(url, options = {}) {
   const {
     active = false,
@@ -1248,6 +1284,34 @@ async function openManagedTab(url, options = {}) {
   }
 
   return tab;
+}
+
+async function openMobileSearchWindow(url) {
+  const windowOptions = buildMobileSearchWindowOptions(url);
+  const browserWindow = await chrome.windows.create(windowOptions);
+  const tab = Array.isArray(browserWindow?.tabs) ? browserWindow.tabs[0] : null;
+
+  if (!browserWindow?.id || !tab?.id) {
+    throw new Error('Mobile search window was not created');
+  }
+
+  managedWindowIds.add(browserWindow.id);
+  managedTabIds.add(tab.id);
+
+  try {
+    await chrome.windows.update(browserWindow.id, {
+      focused: true,
+      width: windowOptions.width,
+      height: windowOptions.height,
+      left: windowOptions.left,
+      top: windowOptions.top
+    });
+  } catch (error) {}
+
+  return {
+    tab,
+    windowId: browserWindow.id
+  };
 }
 
 async function waitForTabLoad(tabId, timeoutMs = TAB_LOAD_TIMEOUT_MS) {
@@ -1363,12 +1427,26 @@ function syncTaskState() {
 
 async function runSingleSearch(keyword, isMobile) {
   let tab = null;
+  let mobileWindowId = null;
 
   try {
-    tab = await openManagedTab(BING_HOME_URL, { active: false });
+    if (isMobile) {
+      const mobileWindow = await openMobileSearchWindow(BING_HOME_URL);
+      tab = mobileWindow.tab;
+      mobileWindowId = mobileWindow.windowId;
+      log('[Mobile] Opened focused Edge mobile-sized window for search.');
+    } else {
+      tab = await openManagedTab(BING_HOME_URL, { active: false });
+    }
 
     await waitForTabLoad(tab.id);
     await waitWithStop(randomInt(...SEARCH_READY_DELAY_MS));
+
+    if (isMobile && tab.windowId) {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch (error) {}
+    }
 
     const prepareResult = await callAutomationMethod(tab.id, 'prepareEnvironment', [{ mobile: isMobile }]);
     if (prepareResult?.summary) {
@@ -1391,7 +1469,9 @@ async function runSingleSearch(keyword, isMobile) {
     await waitWithStop(randomInt(...INTERACTION_SETTLE_DELAY_MS));
     return { success: true };
   } finally {
-    if (tab?.id) {
+    if (mobileWindowId) {
+      await closeWindow(mobileWindowId);
+    } else if (tab?.id) {
       await closeTab(tab.id);
     }
   }
@@ -1510,6 +1590,10 @@ async function runSearchAutomation(count, isMobile) {
           syncSearchState(branchKey, label);
           log(`[${label}] Search ${index} was not confirmed by Rewards API.`, 'warning');
         } catch (error) {
+          if (error.message === USER_STOPPED_ERROR) {
+            throw error;
+          }
+
           branch.lastOutcome = `${label} search ${index}/${targetCount} failed`;
           syncSearchState(branchKey, label);
           log(`[${label}] Search ${index} attempt ${retry + 1} failed: ${error.message}`, 'warning');

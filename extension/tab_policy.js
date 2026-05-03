@@ -1,4 +1,22 @@
 export const MAX_EXTENSION_OPEN_TABS = 2;
+export const MOBILE_SEARCH_WINDOW_BOUNDS = Object.freeze({
+  width: 430,
+  height: 930,
+  left: 40,
+  top: 20
+});
+
+export function buildMobileSearchWindowOptions(url) {
+  return {
+    url,
+    type: 'normal',
+    focused: true,
+    width: MOBILE_SEARCH_WINDOW_BOUNDS.width,
+    height: MOBILE_SEARCH_WINDOW_BOUNDS.height,
+    left: MOBILE_SEARCH_WINDOW_BOUNDS.left,
+    top: MOBILE_SEARCH_WINDOW_BOUNDS.top
+  };
+}
 
 export function isRewardsDashboardUrl(url) {
   if (typeof url !== 'string') return false;
