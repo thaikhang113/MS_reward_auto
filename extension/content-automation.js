@@ -461,8 +461,8 @@
 
     if (!searchInput) {
       if (options.mobile) {
-        window.location.assign(buildSearchNavigationUrl(keyword));
-        return { success: true, fallback: 'url_navigation' };
+        window.setTimeout(() => window.location.assign(buildSearchNavigationUrl(keyword)), 180);
+        return { success: true, fallback: 'scheduled_url_navigation' };
       }
 
       return { success: false, error: 'no_input' };
@@ -480,6 +480,11 @@
 
     await humanTypeString(searchInput, keyword, options.mobile ? 'fast' : 'medium');
     await sleep(randomInt(600, 1500));
+
+    if (options.mobile) {
+      window.setTimeout(() => submitSearch(searchInput), 180);
+      return { success: true, submitted: true, scheduled: true };
+    }
 
     submitSearch(searchInput);
 
@@ -536,27 +541,50 @@
     return scrollPlan.length;
   }
 
+  function scoreSearchResultAnchor(anchor) {
+    if (!/^https?:/i.test(anchor.href || '')) return 0;
+
+    const label = getElementText(anchor);
+    if (/^(all|search|videos|images|maps|copilot|skip to content|accessibility feedback)$/i.test(label)) return 0;
+
+    try {
+      const url = new URL(anchor.href);
+      const host = url.hostname.replace(/^www\./i, '');
+      const bingHost = /(^|\.)bing\.com$/i.test(host);
+      const isBingTrackingUrl = bingHost && /\/(?:ck\/a|aclick)/i.test(url.pathname);
+      if (/rewards\.bing\.com|login\.live\.com|account\.microsoft\.com/i.test(url.hostname)) return 0;
+      if (bingHost && !isBingTrackingUrl) return 0;
+      if (!label && !isBingTrackingUrl) return 0;
+
+      let score = 1;
+      if (!bingHost) score += 5;
+      if (isBingTrackingUrl) score += 8;
+      if (url.searchParams.has('u')) score += 3;
+      if (isInteractableElement(anchor)) score += 2;
+      if (label.length >= 12) score += 2;
+      if (/^\d+$/.test(label)) score -= 4;
+      if (anchor.closest('#b_results, .b_algo, article, main')) score += 1;
+      if (anchor.closest('#b_results .b_algo h2, #b_results .b_algo, [data-bm], article')) score += 2;
+      return Math.max(0, score);
+    } catch (error) {
+      return 0;
+    }
+  }
+
   function findSearchResultAnchor() {
-    const anchors = Array.from(document.querySelectorAll('#b_results h2 a[href], #b_results a[href], main a[href], article a[href]'));
+    const anchors = Array.from(document.querySelectorAll('#b_results .b_algo h2 a[href], #b_results h2 a[href], #b_results .b_algo a[href], #b_results a[href], main a[href], article a[href], a[href*="/ck/a"][href*="u="]'));
+    const candidates = anchors
+      .map((anchor) => ({ anchor, score: scoreSearchResultAnchor(anchor) }))
+      .filter((candidate) => candidate.score > 0);
 
-    return anchors.find((anchor) => {
-      if (!isInteractableElement(anchor)) return false;
-      if (!/^https?:/i.test(anchor.href || '')) return false;
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates[0]?.anchor || null;
+  }
 
-      const label = getElementText(anchor);
-      if (!label || label.length < 3) return false;
-
-      try {
-        const url = new URL(anchor.href);
-        const host = url.hostname.replace(/^www\./i, '');
-        if (/rewards\.bing\.com|login\.live\.com|account\.microsoft\.com/i.test(url.hostname)) return false;
-        if (/bing\.com$/i.test(host) && !/\/(?:ck\/a|aclick)/i.test(url.pathname)) return false;
-      } catch (error) {
-        return false;
-      }
-
-      return true;
-    });
+  function countSearchResultCandidates() {
+    return Array.from(document.querySelectorAll('#b_results .b_algo h2 a[href], #b_results h2 a[href], #b_results .b_algo a[href], #b_results a[href], main a[href], article a[href], a[href*="/ck/a"][href*="u="]'))
+      .filter((anchor) => scoreSearchResultAnchor(anchor) > 0)
+      .length;
   }
 
   async function browseDestinationPage(options = {}) {
@@ -629,7 +657,9 @@
 
     let openedResult = false;
     let resultUrl = null;
+    let resultCandidateCount = 0;
     if (options.mobile) {
+      resultCandidateCount = countSearchResultCandidates();
       const anchor = findSearchResultAnchor();
       if (anchor) {
         anchor.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -646,7 +676,8 @@
       mobile: Boolean(options.mobile),
       steps,
       openedResult,
-      resultUrl
+      resultUrl,
+      resultCandidateCount
     };
   }
 

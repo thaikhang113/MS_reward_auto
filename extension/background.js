@@ -334,6 +334,11 @@ function randomInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+function parseIntegerWithDefault(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function toFiniteNumber(value) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
@@ -1070,15 +1075,15 @@ function sanitizeConfig(input = {}) {
   merged.rewardsLevel = ['member', 'silver', 'gold'].includes(merged.rewardsLevel)
     ? merged.rewardsLevel
     : DEFAULT_CONFIG.rewardsLevel;
-  merged.searchCount = clamp(parseInt(merged.searchCount, 10) || DEFAULT_CONFIG.searchCount, 0, 30);
-  merged.mobileSearchCount = clamp(parseInt(merged.mobileSearchCount, 10) || 0, 0, 30);
-  merged.minDelay = clamp(parseInt(merged.minDelay, 10) || DEFAULT_CONFIG.minDelay, SAFE_DELAY_SECONDS.min, SAFE_DELAY_SECONDS.max);
-  merged.maxDelay = clamp(parseInt(merged.maxDelay, 10) || DEFAULT_CONFIG.maxDelay, merged.minDelay, SAFE_DELAY_SECONDS.max);
+  merged.searchCount = clamp(parseIntegerWithDefault(merged.searchCount, DEFAULT_CONFIG.searchCount), 0, 30);
+  merged.mobileSearchCount = clamp(parseIntegerWithDefault(merged.mobileSearchCount, 0), 0, 30);
+  merged.minDelay = clamp(parseIntegerWithDefault(merged.minDelay, DEFAULT_CONFIG.minDelay), SAFE_DELAY_SECONDS.min, SAFE_DELAY_SECONDS.max);
+  merged.maxDelay = clamp(parseIntegerWithDefault(merged.maxDelay, DEFAULT_CONFIG.maxDelay), merged.minDelay, SAFE_DELAY_SECONDS.max);
   merged.mobileMode = Boolean(merged.mobileMode);
-  merged.maxRetries = clamp(parseInt(merged.maxRetries, 10) || DEFAULT_CONFIG.maxRetries, 0, 5);
-  merged.waveSize = clamp(parseInt(merged.waveSize, 10) || DEFAULT_CONFIG.waveSize, 0, 20);
-  merged.wavePauseMin = clamp(parseInt(merged.wavePauseMin, 10) || DEFAULT_CONFIG.wavePauseMin, 0, 120);
-  merged.speedLevel = clamp(parseInt(merged.speedLevel, 10) || DEFAULT_CONFIG.speedLevel, 1, 6);
+  merged.maxRetries = clamp(parseIntegerWithDefault(merged.maxRetries, DEFAULT_CONFIG.maxRetries), 0, 5);
+  merged.waveSize = clamp(parseIntegerWithDefault(merged.waveSize, DEFAULT_CONFIG.waveSize), 0, 20);
+  merged.wavePauseMin = clamp(parseIntegerWithDefault(merged.wavePauseMin, DEFAULT_CONFIG.wavePauseMin), 0, 120);
+  merged.speedLevel = clamp(parseIntegerWithDefault(merged.speedLevel, DEFAULT_CONFIG.speedLevel), 1, 6);
   merged.mobileWindowModeVersion = DEFAULT_CONFIG.mobileWindowModeVersion;
 
   return merged;
@@ -1503,7 +1508,10 @@ async function runSingleSearch(keyword, isMobile) {
     if (!interactionResult?.success) {
       log('[Search] Interaction step returned a non-success result.', 'warning');
     } else if (isMobile) {
-      log(`[Mobile] Search results engagement: ${interactionResult.steps || 0} scrolls${interactionResult.openedResult ? '; opened result.' : '; no result opened.'}`);
+      const candidateSuffix = Number.isFinite(interactionResult.resultCandidateCount)
+        ? `; candidates ${interactionResult.resultCandidateCount}`
+        : '';
+      log(`[Mobile] Search results engagement: ${interactionResult.steps || 0} scrolls${interactionResult.openedResult ? '; opened result.' : '; no result opened.'}${candidateSuffix}`);
     }
 
     if (isMobile && interactionResult?.openedResult) {

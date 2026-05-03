@@ -15,3 +15,9 @@ test('mobile search visibly browses before checking rewards', () => {
   assert.match(source, /\[Mobile\] Checking Rewards points after visible browsing\./);
   assert.match(source, /waitForInteractiveLoad\(tab\.id,\s*isMobile,\s*'search results'\)/);
 });
+
+test('config sanitizer preserves zero-valued live test controls', () => {
+  assert.match(source, /function parseIntegerWithDefault\(/);
+  assert.match(source, /merged\.searchCount = clamp\(parseIntegerWithDefault\(merged\.searchCount, DEFAULT_CONFIG\.searchCount\), 0, 30\)/);
+  assert.match(source, /merged\.maxRetries = clamp\(parseIntegerWithDefault\(merged\.maxRetries, DEFAULT_CONFIG\.maxRetries\), 0, 5\)/);
+});
