@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   buildTrendsRequest,
   fetchTrendingKeywords,
+  getAllKeywords,
   parseTrendingKeywordsFromPayload
 } from './keywords-data.js';
 
@@ -87,4 +88,53 @@ test('fetchTrendingKeywords supports same-origin tab fetch fallback', async () =
   assert.match(calls[0].endpoint, /rpcids=i0OFE/);
   assert.equal(calls[0].region, 'VN');
   assert.match(calls[0].body, /f\.req=/);
+});
+
+test('fetchTrendingKeywords falls back when the primary fetch returns no tab payload', async () => {
+  const innerPayload = JSON.stringify([
+    null,
+    [
+      ['fallback trend', null, 'VN', [], null, null, 100, null, 100, ['fallback related'], [], [], 'fallback trend']
+    ]
+  ]);
+  const text = `)]}'\n\n123\n${JSON.stringify([['wrb.fr', 'i0OFE', innerPayload]])}`;
+  const calls = [];
+
+  const keywords = await fetchTrendingKeywords({
+    forceRefresh: true,
+    fetchText: async (request) => {
+      calls.push(['primary', request.endpoint]);
+      throw new Error('Google Trends tab returned empty payload');
+    },
+    fallbackFetchText: async (request) => {
+      calls.push(['fallback', request.endpoint]);
+      return text;
+    }
+  });
+
+  assert.deepEqual(keywords, ['fallback trend', 'fallback related']);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0][0], 'primary');
+  assert.equal(calls[1][0], 'fallback');
+});
+
+test('getAllKeywords forwards the Trends fallback fetcher', async () => {
+  const innerPayload = JSON.stringify([
+    null,
+    [
+      ['wrapper trend', null, 'VN', [], null, null, 100, null, 100, ['wrapper related'], [], [], 'wrapper trend']
+    ]
+  ]);
+  const text = `)]}'\n\n123\n${JSON.stringify([['wrb.fr', 'i0OFE', innerPayload]])}`;
+
+  const keywords = await getAllKeywords({
+    forceRefresh: true,
+    fetchText: async () => {
+      throw new Error('Google Trends tab returned empty payload');
+    },
+    fallbackFetchText: async () => text
+  });
+
+  assert.equal(keywords.includes('wrapper trend'), true);
+  assert.equal(keywords.includes('wrapper related'), true);
 });

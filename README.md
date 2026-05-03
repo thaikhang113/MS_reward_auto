@@ -6,7 +6,7 @@ Chrome/Edge extension tu dong chay Microsoft Rewards searches va daily tasks.
 
 - PC search va mobile search.
 - Mobile search gia lap bang UA rules, touch/viewport mobile trong content script.
-- Lay keyword chinh tu Google Trends Viet Nam.
+- Lay keyword chinh tu Google Trends Viet Nam; thu background fetch truoc, fallback sang tab Google Trends neu browser/Google tra loi rong hoac reject request.
 - Neu Rewards API tra payload loi, extension tu mo/reuse Rewards Dashboard de recovery.
 - Gioi han tab extension quan ly toi da 2 tab, tab moi tao o background (`active: false`) de khong cuop focus khi ban dang lam viec.
 - Doc diem/counter tu Rewards API khi co the, fallback sang dashboard recovery khi API khong on dinh.
@@ -56,7 +56,7 @@ Neu log bao dashboard payload invalid, extension se mo/reuse mot tab Rewards Das
 
 ```bash
 cd extension
-node --test daily_tasks_new.test.js rewards_dashboard.test.js keywords-data.test.js tab_policy.test.js
+node --test daily_tasks_new.test.js rewards_dashboard.test.js keywords-data.test.js tab_policy.test.js search_verification.test.js
 ```
 
 ## Luu y

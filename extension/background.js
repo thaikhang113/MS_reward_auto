@@ -744,6 +744,38 @@ async function fetchRewardsDashboardViaTab(options = {}) {
   }
 }
 
+async function fetchGoogleTrendsTextInBackground(request) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const headers = { ...(request.headers || {}) };
+  delete headers.Referer;
+  delete headers.referer;
+
+  try {
+    const response = await fetch(request.endpoint, {
+      method: request.method,
+      cache: 'no-store',
+      credentials: 'include',
+      headers,
+      body: request.body,
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const text = await response.text();
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('Google Trends background fetch returned empty payload');
+    }
+
+    return text;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function fetchGoogleTrendsTextViaTab(request) {
   let tab = null;
 
@@ -1046,7 +1078,8 @@ function getSafeDelayRange(config) {
 async function refreshKeywordCache(forceRefresh = false) {
   keywordCache = await getAllKeywords({
     forceRefresh,
-    fetchText: fetchGoogleTrendsTextViaTab,
+    fetchText: fetchGoogleTrendsTextInBackground,
+    fallbackFetchText: fetchGoogleTrendsTextViaTab,
     onError: (error) => {
       log(`[Keywords] Google Trends fetch failed: ${error.message}. Using fallback pool.`, 'warning');
     }
