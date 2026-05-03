@@ -6,7 +6,7 @@ Chrome/Edge extension tu dong chay Microsoft Rewards searches va daily tasks.
 
 - PC search va mobile search.
 - Mobile search gia lap bang UA rules, touch/viewport mobile trong content script.
-- Lay keyword chinh tu Google Trends Viet Nam; thu background fetch truoc, fallback sang tab Google Trends neu browser/Google tra loi rong hoac reject request.
+- Lay keyword chinh tu Google Trends Viet Nam; thu RPC truoc, fallback sang tab Google Trends, roi den RSS neu browser/Google tra loi rong hoac reject request.
 - Neu Rewards API tra payload loi, extension tu mo/reuse Rewards Dashboard de recovery.
 - Gioi han tab extension quan ly toi da 2 tab, tab moi tao o background (`active: false`) de khong cuop focus khi ban dang lam viec.
 - Doc diem/counter tu Rewards API khi co the, fallback sang dashboard recovery khi API khong on dinh.
@@ -42,6 +42,7 @@ Neu log bao dashboard payload invalid, extension se mo/reuse mot tab Rewards Das
 - Bing Search: `https://www.bing.com/`
 - Google Trends page: `https://trends.google.com/trending?geo=VN&hl=vi`
 - Google Trends RPC endpoint observed from Trends page network: `https://trends.google.com/_/TrendsUi/data/batchexecute?rpcids=i0OFE&source-path=%2Ftrending&hl=vi&rt=c`
+- Google Trends RSS fallback: `https://trends.google.com/trending/rss?geo=VN&hl=vi`
 
 ## Cau truc
 

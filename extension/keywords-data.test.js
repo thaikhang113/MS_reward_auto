@@ -5,6 +5,7 @@ import {
   buildTrendsRequest,
   fetchTrendingKeywords,
   getAllKeywords,
+  parseTrendingKeywordsFromRss,
   parseTrendingKeywordsFromPayload
 } from './keywords-data.js';
 
@@ -64,6 +65,18 @@ test('parseTrendingKeywordsFromPayload reads current Google Trends topic and rel
     'arsenal',
     'arsenal vs'
   ]);
+});
+
+test('parseTrendingKeywordsFromRss reads item titles from Google Trends RSS', () => {
+  const rss = `<?xml version="1.0" encoding="UTF-8"?>
+  <rss><channel>
+    <title>Daily Search Trends</title>
+    <item><title>juventus</title><ht:approx_traffic>500+</ht:approx_traffic></item>
+    <item><title><![CDATA[real betis vs]]></title><ht:approx_traffic>200+</ht:approx_traffic></item>
+    <item><title>real betis vs</title><ht:approx_traffic>100+</ht:approx_traffic></item>
+  </channel></rss>`;
+
+  assert.deepEqual(parseTrendingKeywordsFromRss(rss), ['juventus', 'real betis vs']);
 });
 
 test('fetchTrendingKeywords supports same-origin tab fetch fallback', async () => {
@@ -137,4 +150,32 @@ test('getAllKeywords forwards the Trends fallback fetcher', async () => {
 
   assert.equal(keywords.includes('wrapper trend'), true);
   assert.equal(keywords.includes('wrapper related'), true);
+});
+
+test('fetchTrendingKeywords falls back to RSS when RPC fetchers fail', async () => {
+  const rss = `<?xml version="1.0" encoding="UTF-8"?>
+  <rss><channel>
+    <item><title>rss trend</title></item>
+    <item><title><![CDATA[rss related]]></title></item>
+  </channel></rss>`;
+  const calls = [];
+
+  const keywords = await fetchTrendingKeywords({
+    forceRefresh: true,
+    fetchText: async () => {
+      calls.push('primary');
+      throw new Error('HTTP 400');
+    },
+    fallbackFetchText: async () => {
+      calls.push('tab');
+      throw new Error('Google Trends tab returned empty payload');
+    },
+    rssFetchText: async (request) => {
+      calls.push(request.kind);
+      return rss;
+    }
+  });
+
+  assert.deepEqual(keywords, ['rss trend', 'rss related']);
+  assert.deepEqual(calls, ['primary', 'tab', 'rss']);
 });

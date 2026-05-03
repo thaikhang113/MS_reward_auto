@@ -4,6 +4,7 @@ const GOOGLE_TRENDS_REGION = 'VN';
 const GOOGLE_TRENDS_LANGUAGE = 'vi';
 const GOOGLE_TRENDS_TIMEOUT_MS = 15000;
 const KEYWORD_CACHE_TTL_MS = 30 * 60 * 1000;
+const GOOGLE_TRENDS_RSS_BASE_URL = 'https://trends.google.com/trending/rss';
 
 export const KEYWORD_LIST = [
   'microsoft rewards',
@@ -179,6 +180,7 @@ async function fetchTextWithTimeout(url, options = {}, timeoutMs = GOOGLE_TRENDS
 
 export function buildTrendsFetchRequest(region = GOOGLE_TRENDS_REGION, language = GOOGLE_TRENDS_LANGUAGE) {
   return {
+    kind: 'rpc',
     endpoint: GOOGLE_TRENDS_ENDPOINT,
     method: 'POST',
     headers: {
@@ -192,11 +194,36 @@ export function buildTrendsFetchRequest(region = GOOGLE_TRENDS_REGION, language 
   };
 }
 
+export function buildTrendsRssFetchRequest(region = GOOGLE_TRENDS_REGION, language = GOOGLE_TRENDS_LANGUAGE) {
+  const params = new URLSearchParams({
+    geo: region,
+    hl: language
+  });
+
+  return {
+    kind: 'rss',
+    endpoint: `${GOOGLE_TRENDS_RSS_BASE_URL}?${params.toString()}`,
+    method: 'GET',
+    headers: {
+      Accept: 'application/rss+xml, application/xml, text/xml, */*'
+    },
+    region,
+    language
+  };
+}
+
 async function fetchGoogleTrendsText(request) {
   return fetchTextWithTimeout(request.endpoint, {
     method: request.method,
     headers: request.headers,
     body: request.body
+  });
+}
+
+async function fetchGoogleTrendsRssText(request) {
+  return fetchTextWithTimeout(request.endpoint, {
+    method: request.method,
+    headers: request.headers
   });
 }
 
@@ -246,7 +273,41 @@ export function parseTrendingKeywordsFromPayload(payload) {
   return dedupeKeywords(collected);
 }
 
-async function readTrendingKeywords(fetchText, request) {
+function decodeXmlText(value) {
+  return String(value || '')
+    .replace(/<!\[CDATA\[|\]\]>/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .trim();
+}
+
+export function parseTrendingKeywordsFromRss(text) {
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new Error('Google Trends RSS returned empty payload');
+  }
+
+  const collected = [];
+  const itemMatches = text.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi);
+
+  for (const itemMatch of itemMatches) {
+    const titleMatch = itemMatch[1].match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+    if (titleMatch) {
+      collected.push(decodeXmlText(titleMatch[1]));
+    }
+  }
+
+  const keywords = dedupeKeywords(collected);
+  if (!keywords.length) {
+    throw new Error('Google Trends RSS returned no keywords');
+  }
+
+  return keywords;
+}
+
+async function readTrendingKeywordsFromRpc(fetchText, request) {
   const text = await fetchText(request);
   if (typeof text !== 'string' || !text.trim()) {
     throw new Error('Google Trends returned empty payload');
@@ -262,15 +323,21 @@ async function readTrendingKeywords(fetchText, request) {
   return keywords;
 }
 
-function buildCombinedFetchError(primaryError, fallbackError) {
-  if (!fallbackError || primaryError === fallbackError) {
-    return primaryError;
+async function readTrendingKeywordsFromRss(fetchText, request) {
+  const text = await fetchText(request);
+  return parseTrendingKeywordsFromRss(text);
+}
+
+function buildCombinedFetchError(errors) {
+  const usableErrors = errors.filter(Boolean);
+  if (usableErrors.length <= 1) {
+    return usableErrors[0] || new Error('Google Trends fetch failed');
   }
 
   const error = new Error(
-    `Google Trends primary fetch failed: ${primaryError.message}; fallback failed: ${fallbackError.message}`
+    `Google Trends fetch failed: ${usableErrors.map((entry) => `${entry.kind}: ${entry.error.message}`).join('; ')}`
   );
-  error.cause = fallbackError;
+  error.cause = usableErrors[usableErrors.length - 1].error;
   return error;
 }
 
@@ -377,7 +444,8 @@ export async function fetchTrendingKeywords(options = {}) {
     forceRefresh = false,
     region = GOOGLE_TRENDS_REGION,
     fetchText = fetchGoogleTrendsText,
-    fallbackFetchText = null
+    fallbackFetchText = null,
+    rssFetchText = fetchGoogleTrendsRssText
   } = options;
 
   const now = Date.now();
@@ -385,27 +453,27 @@ export async function fetchTrendingKeywords(options = {}) {
     return [...cachedTrendingKeywords];
   }
 
-  const request = buildTrendsFetchRequest(region, GOOGLE_TRENDS_LANGUAGE);
-  const fetchers = [fetchText, fallbackFetchText].filter((candidate) => typeof candidate === 'function');
-  let primaryError = null;
-  let fallbackError = null;
+  const rpcRequest = buildTrendsFetchRequest(region, GOOGLE_TRENDS_LANGUAGE);
+  const rssRequest = buildTrendsRssFetchRequest(region, GOOGLE_TRENDS_LANGUAGE);
+  const attempts = [
+    { kind: 'primary', fetcher: fetchText, request: rpcRequest, reader: readTrendingKeywordsFromRpc },
+    { kind: 'fallback', fetcher: fallbackFetchText, request: rpcRequest, reader: readTrendingKeywordsFromRpc },
+    { kind: 'rss', fetcher: rssFetchText, request: rssRequest, reader: readTrendingKeywordsFromRss }
+  ].filter((attempt) => typeof attempt.fetcher === 'function');
+  const errors = [];
 
-  for (const fetcher of fetchers) {
+  for (const attempt of attempts) {
     try {
-      const keywords = await readTrendingKeywords(fetcher, request);
+      const keywords = await attempt.reader(attempt.fetcher, attempt.request);
       cachedTrendingKeywords = keywords;
       cachedAt = now;
       return [...cachedTrendingKeywords];
     } catch (error) {
-      if (!primaryError) {
-        primaryError = error;
-      } else {
-        fallbackError = error;
-      }
+      errors.push({ kind: attempt.kind, error });
     }
   }
 
-  throw buildCombinedFetchError(primaryError, fallbackError);
+  throw buildCombinedFetchError(errors);
 }
 
 export async function getKeyWord(options = {}) {
@@ -418,13 +486,14 @@ export async function getAllKeywords(options = {}) {
     now = new Date(),
     fetchText,
     fallbackFetchText,
+    rssFetchText,
     onError
   } = options;
 
   let trendingKeywords = [];
 
   try {
-    trendingKeywords = await fetchTrendingKeywords({ forceRefresh, fetchText, fallbackFetchText });
+    trendingKeywords = await fetchTrendingKeywords({ forceRefresh, fetchText, fallbackFetchText, rssFetchText });
   } catch (error) {
     if (typeof onError === 'function') {
       onError(error);

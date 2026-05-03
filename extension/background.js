@@ -686,6 +686,24 @@ async function fetchRewardsDashboardViaTab(options = {}) {
       target: { tabId: tab.id },
       world: AUTOMATION_WORLD,
       func: async (apiUrl) => {
+        const buildVisiblePointsDashboard = (availablePoints) => ({
+          userStatus: {
+            availablePoints,
+            counters: {}
+          }
+        });
+
+        const isDashboardPayload = (payload) => {
+          const dashboard = payload?.dashboard || payload;
+          return Boolean(
+            dashboard
+            && typeof dashboard === 'object'
+            && !Array.isArray(dashboard)
+            && dashboard.userStatus
+            && typeof dashboard.userStatus === 'object'
+          );
+        };
+
         const scrapeVisiblePoints = () => {
           const text = document.body?.innerText || '';
           const match = text.match(/Available points\s+([\d,.\s]+)/i);
@@ -706,28 +724,28 @@ async function fetchRewardsDashboardViaTab(options = {}) {
         if (!response.ok) {
           const visiblePoints = scrapeVisiblePoints();
           if (Number.isFinite(visiblePoints)) {
-            return {
-              userStatus: {
-                availablePoints: visiblePoints,
-                counters: {}
-              }
-            };
+            return buildVisiblePointsDashboard(visiblePoints);
           }
 
           throw new Error(`HTTP ${response.status}`);
         }
 
         try {
-          return await response.json();
+          const payload = await response.json();
+          if (isDashboardPayload(payload)) {
+            return payload;
+          }
+
+          const visiblePoints = scrapeVisiblePoints();
+          if (Number.isFinite(visiblePoints)) {
+            return buildVisiblePointsDashboard(visiblePoints);
+          }
+
+          return payload;
         } catch (error) {
           const visiblePoints = scrapeVisiblePoints();
           if (Number.isFinite(visiblePoints)) {
-            return {
-              userStatus: {
-                availablePoints: visiblePoints,
-                counters: {}
-              }
-            };
+            return buildVisiblePointsDashboard(visiblePoints);
           }
 
           throw error;
