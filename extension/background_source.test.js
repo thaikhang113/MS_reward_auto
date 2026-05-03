@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const source = readFileSync(new URL('./background.js', import.meta.url), 'utf8');
+const plannerSource = readFileSync(new URL('./rewards_planner.js', import.meta.url), 'utf8');
 
 test('Rewards dashboard tab fallback opens focused for authenticated dashboard fetch', () => {
   assert.match(source, /chrome\.windows\.update\(tab\.windowId,\s*\{\s*focused:\s*true\s*\}\)/s);
@@ -22,13 +23,25 @@ test('config sanitizer preserves zero-valued live test controls', () => {
   assert.match(source, /merged\.maxRetries = clamp\(parseIntegerWithDefault\(merged\.maxRetries, DEFAULT_CONFIG\.maxRetries\), 0, 5\)/);
 });
 
-test('auto resume checks remaining search work without focused dashboard recovery', () => {
+test('auto resume checks remaining rewards work without focused dashboard recovery', () => {
   assert.match(source, /autoRunOnOpen:\s*true/);
-  assert.match(source, /function getRemainingSearchCountFromCounter\(/);
-  assert.match(source, /Math\.ceil\(remainingPoints \/ 3\)/);
+  assert.match(source, /autoRunTasks:\s*true/);
+  assert.match(source, /buildAutomationPlan\(config,\s*snapshot\)/);
+  assert.match(source, /hasAutomationWork\(plan\)/);
   assert.match(source, /async function maybeAutoStartSearchRun\(/);
   assert.match(source, /allowFocusedRecovery:\s*false/);
   assert.match(source, /message\.action === 'maybe_auto_start'/);
+  assert.match(plannerSource, /function getRemainingSearchCountFromCounter\(/);
+  assert.match(plannerSource, /Math\.ceil\(remainingPoints \/ SEARCH_POINTS_PER_QUERY\)/);
+});
+
+test('search start uses automation planner to skip completed workers', () => {
+  assert.match(source, /const plan = buildAutomationPlan\(config,\s*baselineSnapshot\)/);
+  assert.match(source, /if \(plan\.mobile\.count > 0\) \{/);
+  assert.match(source, /Mobile search already complete; skipping mobile worker/);
+  assert.match(source, /if \(plan\.pc\.count > 0\) \{/);
+  assert.match(source, /PC search already complete; skipping PC worker/);
+  assert.match(source, /scanUncompletedTasks\(dashboard\)/);
 });
 
 test('focused dashboard recovery is opt-in only', () => {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Microsoft Rewards Auto",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Automation dashboard for Microsoft Rewards searches and daily tasks.",
   "permissions": [
     "tabs",

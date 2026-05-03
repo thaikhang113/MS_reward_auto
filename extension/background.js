@@ -1,6 +1,7 @@
-import { fetchPendingDailyTaskUrls, getTaskDedupKey, normalizeTaskUrl } from './daily_tasks_new.js';
+import { fetchPendingDailyTaskUrls, getTaskDedupKey, normalizeTaskUrl, scanUncompletedTasks } from './daily_tasks_new.js';
 import { getAllKeywords } from './keywords-data.js';
 import { getDashboardFromPayload, normalizeRewardsCounter } from './rewards_dashboard.js';
+import { buildAutomationPlan, getRemainingSearchCountFromCounter, hasAutomationWork } from './rewards_planner.js';
 import { shouldAcceptUnconfirmedSearch } from './search_verification.js';
 import { buildMobileSearchWindowOptions, planManagedTabOpen } from './tab_policy.js';
 
@@ -16,6 +17,7 @@ const DEFAULT_CONFIG = Object.freeze({
   wavePauseMin: 15,
   speedLevel: 3,
   autoRunOnOpen: true,
+  autoRunTasks: true,
   mobileWindowModeVersion: 1
 });
 
@@ -361,34 +363,6 @@ function cloneCounter(counter) {
         score: counter.score
       }
     : null;
-}
-
-function getRemainingSearchCountFromCounter(counter) {
-  if (!counter) return null;
-  if (counter.complete) return 0;
-
-  const remainingPoints = Number.isFinite(counter.remaining)
-    ? counter.remaining
-    : (
-        Number.isFinite(counter.max) && Number.isFinite(counter.progress)
-          ? counter.max - counter.progress
-          : null
-      );
-
-  if (!Number.isFinite(remainingPoints)) return null;
-  return Math.max(0, Math.ceil(remainingPoints / 3));
-}
-
-function hasConfiguredSearchWork(config, snapshot) {
-  const mobileRemaining = getRemainingSearchCountFromCounter(getSnapshotCounter(snapshot, 'mobile'));
-  const pcRemaining = getRemainingSearchCountFromCounter(getSnapshotCounter(snapshot, 'pc'));
-  const wantsMobile = Boolean(config.mobileMode)
-    && Number(config.mobileSearchCount) > 0
-    && (mobileRemaining === null || Math.min(Number(config.mobileSearchCount), mobileRemaining) > 0);
-  const wantsPc = Number(config.searchCount) > 0
-    && (pcRemaining === null || Math.min(Number(config.searchCount), pcRemaining) > 0);
-
-  return wantsMobile || wantsPc;
 }
 
 function buildRetryBackoffDelayMs(range, retryIndex) {
@@ -954,7 +928,8 @@ function createDashboardSnapshot(dashboard, source) {
     availablePoints: toFiniteNumber(dashboard?.userStatus?.availablePoints),
     counters,
     pcCounter: pickBestCounter(counters, 'pc'),
-    mobileCounter: pickBestCounter(counters, 'mobile')
+    mobileCounter: pickBestCounter(counters, 'mobile'),
+    pendingTaskUrls: scanUncompletedTasks(dashboard)
   };
 }
 
@@ -1124,6 +1099,7 @@ function sanitizeConfig(input = {}) {
   merged.wavePauseMin = clamp(parseIntegerWithDefault(merged.wavePauseMin, DEFAULT_CONFIG.wavePauseMin), 0, 120);
   merged.speedLevel = clamp(parseIntegerWithDefault(merged.speedLevel, DEFAULT_CONFIG.speedLevel), 1, 6);
   merged.autoRunOnOpen = merged.autoRunOnOpen !== false;
+  merged.autoRunTasks = merged.autoRunTasks !== false;
   merged.mobileWindowModeVersion = DEFAULT_CONFIG.mobileWindowModeVersion;
 
   return merged;
@@ -1485,9 +1461,12 @@ async function setMobileMode(enabled) {
 
 function syncSearchState(branchKey, label) {
   const branch = state[branchKey];
+  const queuedRemaining = Math.max(0, branch.planned - branch.executed);
+  const counterRemaining = getRemainingSearchCountFromCounter(branch.counter);
+
   branch.notCounted = Math.max(0, branch.executed - branch.counted);
   branch.progressText = `${branch.counted}/${branch.planned}`;
-  branch.remaining = Math.max(0, branch.planned - branch.executed);
+  branch.remaining = counterRemaining ?? queuedRemaining;
   state.progress = `${label} ${branch.progressText}`;
   state.percent = branch.planned > 0
     ? Math.min(100, Math.floor((branch.counted / branch.planned) * 100))
@@ -1503,6 +1482,17 @@ function syncTaskState() {
     ? Math.min(100, Math.floor((state.tasks.completed / state.tasks.planned) * 100))
     : 0;
   broadcastState();
+}
+
+function logAutomationPlan(plan, context = 'Run') {
+  const mobileText = plan.mobile.reason === 'complete'
+    ? 'complete'
+    : `${plan.mobile.count}${plan.mobile.remaining !== null ? `/${plan.mobile.remaining}` : ''}`;
+  const pcText = plan.pc.reason === 'complete'
+    ? 'complete'
+    : `${plan.pc.count}${plan.pc.remaining !== null ? `/${plan.pc.remaining}` : ''}`;
+
+  log(`[${context}] Plan: tasks ${plan.tasks.count}, mobile ${mobileText}, PC ${pcText}.`);
 }
 
 async function runSingleSearch(keyword, isMobile) {
@@ -2139,6 +2129,8 @@ async function runStartAutomation() {
       context: 'run baseline',
       logCounters: true
     });
+    const plan = buildAutomationPlan(config, baselineSnapshot);
+    logAutomationPlan(plan, 'Run');
 
     if (Number.isFinite(baselineSnapshot.availablePoints)) {
       applyBaselinePoints(baselineSnapshot.availablePoints);
@@ -2146,12 +2138,38 @@ async function runStartAutomation() {
       broadcastState();
     }
 
-    if (config.mobileMode && config.mobileSearchCount > 0) {
-      await runSearchAutomation(config.mobileSearchCount, true);
+    if (!hasAutomationWork(plan)) {
+      state.status = 'done';
+      state.progress = 'Completed';
+      state.percent = 100;
+      log('[Run] No remaining Rewards work detected.', 'success');
+      broadcastState();
+      return;
+    }
+
+    if (plan.tasks.count > 0) {
+      log(`[Run] Pending dashboard tasks detected; running ${plan.tasks.count} task(s) before searches.`);
+      await runDailyTasksAutomation();
+      assertNotStopped();
+      state.status = 'running';
+      state.progress = 'Preparing searches';
+      state.percent = 0;
+      broadcastState();
+      await startKeepAlive('start_search');
+    }
+
+    if (plan.mobile.count > 0) {
+      await runSearchAutomation(plan.mobile.count, true);
+    } else if (plan.mobile.reason === 'complete') {
+      log('[Run] Mobile search already complete; skipping mobile worker.');
     }
 
     assertNotStopped();
-    await runSearchAutomation(config.searchCount, false);
+    if (plan.pc.count > 0) {
+      await runSearchAutomation(plan.pc.count, false);
+    } else if (plan.pc.reason === 'complete') {
+      log('[Run] PC search already complete; skipping PC worker.');
+    }
 
     const finalSnapshot = await fetchRewardsDashboard({
       context: 'final verification',
@@ -2238,16 +2256,19 @@ async function maybeAutoStartSearchRun(reason = 'auto') {
       allowFocusedRecovery: false
     });
   } catch (error) {
-    log(`[Auto] Could not check remaining searches in background: ${error.message}`, 'warning');
+    log(`[Auto] Could not check remaining Rewards work in background: ${error.message}`, 'warning');
     return { started: false, reason: 'dashboard_unavailable' };
   }
 
-  if (!hasConfiguredSearchWork(config, snapshot)) {
-    log('[Auto] No remaining search work detected.');
+  const plan = buildAutomationPlan(config, snapshot);
+  logAutomationPlan(plan, 'Auto');
+
+  if (!hasAutomationWork(plan)) {
+    log('[Auto] No remaining Rewards work detected.');
     return { started: false, reason: 'complete' };
   }
 
-  log('[Auto] Remaining search work detected; starting background search run.', 'success');
+  log('[Auto] Remaining Rewards work detected; starting background run.', 'success');
   startSearchRun();
   return { started: true, reason: 'remaining_work' };
 }
