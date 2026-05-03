@@ -177,6 +177,29 @@ async function fetchTextWithTimeout(url, options = {}, timeoutMs = GOOGLE_TRENDS
   }
 }
 
+export function buildTrendsFetchRequest(region = GOOGLE_TRENDS_REGION, language = GOOGLE_TRENDS_LANGUAGE) {
+  return {
+    endpoint: GOOGLE_TRENDS_ENDPOINT,
+    method: 'POST',
+    headers: {
+      Accept: '*/*',
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      Referer: `https://trends.google.com/trending?geo=${encodeURIComponent(region)}&hl=${encodeURIComponent(language)}`
+    },
+    body: buildTrendsRequest(region, language),
+    region,
+    language
+  };
+}
+
+async function fetchGoogleTrendsText(request) {
+  return fetchTextWithTimeout(request.endpoint, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body
+  });
+}
+
 function extractBatchedPayload(text) {
   const payloadLine = text
     .split('\n')
@@ -324,7 +347,8 @@ export function getDynamicKeywords(now = new Date()) {
 export async function fetchTrendingKeywords(options = {}) {
   const {
     forceRefresh = false,
-    region = GOOGLE_TRENDS_REGION
+    region = GOOGLE_TRENDS_REGION,
+    fetchText = fetchGoogleTrendsText
   } = options;
 
   const now = Date.now();
@@ -332,16 +356,7 @@ export async function fetchTrendingKeywords(options = {}) {
     return [...cachedTrendingKeywords];
   }
 
-  const text = await fetchTextWithTimeout(GOOGLE_TRENDS_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      Accept: '*/*',
-      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-      Origin: 'https://trends.google.com',
-      Referer: `https://trends.google.com/trending?geo=${encodeURIComponent(region)}&hl=${encodeURIComponent(GOOGLE_TRENDS_LANGUAGE)}`
-    },
-    body: buildTrendsRequest(region, GOOGLE_TRENDS_LANGUAGE)
-  });
+  const text = await fetchText(buildTrendsFetchRequest(region, GOOGLE_TRENDS_LANGUAGE));
 
   const payload = extractBatchedPayload(text);
   const keywords = parseTrendingKeywordsFromPayload(payload);
@@ -363,13 +378,14 @@ export async function getAllKeywords(options = {}) {
   const {
     forceRefresh = false,
     now = new Date(),
+    fetchText,
     onError
   } = options;
 
   let trendingKeywords = [];
 
   try {
-    trendingKeywords = await fetchTrendingKeywords({ forceRefresh });
+    trendingKeywords = await fetchTrendingKeywords({ forceRefresh, fetchText });
   } catch (error) {
     if (typeof onError === 'function') {
       onError(error);

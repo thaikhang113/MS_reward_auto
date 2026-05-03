@@ -1,6 +1,7 @@
 import { fetchPendingDailyTaskUrls, getTaskDedupKey, normalizeTaskUrl } from './daily_tasks_new.js';
 import { getAllKeywords } from './keywords-data.js';
 import { getDashboardFromPayload, normalizeRewardsCounter } from './rewards_dashboard.js';
+import { shouldAcceptUnconfirmedSearch } from './search_verification.js';
 import { planManagedTabOpen } from './tab_policy.js';
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -19,6 +20,7 @@ const DEFAULT_CONFIG = Object.freeze({
 const BING_HOME_URL = 'https://www.bing.com/';
 const REWARDS_HOME_URL = 'https://rewards.bing.com/';
 const REWARDS_API_URL = 'https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest';
+const GOOGLE_TRENDS_PAGE_URL = 'https://trends.google.com/trending?geo=VN&hl=vi';
 const MOBILE_RULESET_ID = 'mobile_ua_rules';
 const AUTOMATION_WORLD = 'MAIN';
 const FETCH_TIMEOUT_MS = 15000;
@@ -742,6 +744,54 @@ async function fetchRewardsDashboardViaTab(options = {}) {
   }
 }
 
+async function fetchGoogleTrendsTextViaTab(request) {
+  let tab = null;
+
+  try {
+    const pageUrl = `https://trends.google.com/trending?geo=${encodeURIComponent(request.region || 'VN')}&hl=${encodeURIComponent(request.language || 'vi')}`;
+    tab = await openManagedTab(pageUrl || GOOGLE_TRENDS_PAGE_URL, { active: false });
+
+    await waitForTabLoad(tab.id);
+    await waitWithStop(900);
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: AUTOMATION_WORLD,
+      func: async (fetchRequest) => {
+        const headers = { ...(fetchRequest.headers || {}) };
+        delete headers.Referer;
+        delete headers.referer;
+
+        const response = await fetch(fetchRequest.endpoint, {
+          method: fetchRequest.method,
+          cache: 'no-store',
+          credentials: 'include',
+          headers,
+          body: fetchRequest.body
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        return response.text();
+      },
+      args: [request]
+    });
+
+    const text = results?.[0]?.result;
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('Google Trends tab returned empty payload');
+    }
+
+    return text;
+  } finally {
+    if (tab?.id) {
+      await closeTab(tab.id);
+    }
+  }
+}
+
 function getCountersSnapshot(dashboard) {
   const counters = dashboard?.userStatus?.counters;
   if (!counters || typeof counters !== 'object') return {};
@@ -996,6 +1046,7 @@ function getSafeDelayRange(config) {
 async function refreshKeywordCache(forceRefresh = false) {
   keywordCache = await getAllKeywords({
     forceRefresh,
+    fetchText: fetchGoogleTrendsTextViaTab,
     onError: (error) => {
       log(`[Keywords] Google Trends fetch failed: ${error.message}. Using fallback pool.`, 'warning');
     }
@@ -1378,15 +1429,28 @@ async function runSearchAutomation(count, isMobile) {
           branch.verificationBadge = verification.mode === 'counter' ? SUCCESS_BADGE : FALLBACK_BADGE;
           updateSummaryBadge();
 
-          if (verification.counted) {
+          const acceptBestEffort = shouldAcceptUnconfirmedSearch({
+            isMobile,
+            initialCounter,
+            verification
+          });
+
+          if (verification.counted || acceptBestEffort) {
             counted = true;
             branch.counted += 1;
             branch.lastConfidence = verification.confidence;
-            branch.lastOutcome = `${label} search ${index}/${targetCount} counted`;
+            branch.lastOutcome = acceptBestEffort
+              ? `${label} search ${index}/${targetCount} submitted`
+              : `${label} search ${index}/${targetCount} counted`;
             if (branch.counter) {
               branch.remaining = branch.counter.remaining;
             }
-            log(`[${label}] Search ${index} counted via ${verification.mode}${branch.counter ? ` (${formatCounter(branch.counter)})` : ''}`, 'success');
+            log(
+              acceptBestEffort
+                ? `[${label}] Search ${index} submitted; Rewards API has no mobile counter, accepting best-effort.`
+                : `[${label}] Search ${index} counted via ${verification.mode}${branch.counter ? ` (${formatCounter(branch.counter)})` : ''}`,
+              'success'
+            );
             syncSearchState(branchKey, label);
             break;
           }

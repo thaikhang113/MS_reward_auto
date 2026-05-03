@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   buildTrendsRequest,
+  fetchTrendingKeywords,
   parseTrendingKeywordsFromPayload
 } from './keywords-data.js';
 
@@ -62,4 +63,28 @@ test('parseTrendingKeywordsFromPayload reads current Google Trends topic and rel
     'arsenal',
     'arsenal vs'
   ]);
+});
+
+test('fetchTrendingKeywords supports same-origin tab fetch fallback', async () => {
+  const innerPayload = JSON.stringify([
+    null,
+    [
+      ['trend one', null, 'VN', [], null, null, 100, null, 100, ['trend related'], [], [], 'trend one']
+    ]
+  ]);
+  const text = `)]}'\n\n123\n${JSON.stringify([['wrb.fr', 'i0OFE', innerPayload]])}`;
+  const calls = [];
+
+  const keywords = await fetchTrendingKeywords({
+    forceRefresh: true,
+    fetchText: async (request) => {
+      calls.push(request);
+      return text;
+    }
+  });
+
+  assert.deepEqual(keywords, ['trend one', 'trend related']);
+  assert.match(calls[0].endpoint, /rpcids=i0OFE/);
+  assert.equal(calls[0].region, 'VN');
+  assert.match(calls[0].body, /f\.req=/);
 });
