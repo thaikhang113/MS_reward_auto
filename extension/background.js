@@ -15,6 +15,7 @@ const DEFAULT_CONFIG = Object.freeze({
   waveSize: 4,
   wavePauseMin: 15,
   speedLevel: 3,
+  autoRunOnOpen: true,
   mobileWindowModeVersion: 1
 });
 
@@ -360,6 +361,34 @@ function cloneCounter(counter) {
         score: counter.score
       }
     : null;
+}
+
+function getRemainingSearchCountFromCounter(counter) {
+  if (!counter) return null;
+  if (counter.complete) return 0;
+
+  const remainingPoints = Number.isFinite(counter.remaining)
+    ? counter.remaining
+    : (
+        Number.isFinite(counter.max) && Number.isFinite(counter.progress)
+          ? counter.max - counter.progress
+          : null
+      );
+
+  if (!Number.isFinite(remainingPoints)) return null;
+  return Math.max(0, Math.ceil(remainingPoints / 3));
+}
+
+function hasConfiguredSearchWork(config, snapshot) {
+  const mobileRemaining = getRemainingSearchCountFromCounter(getSnapshotCounter(snapshot, 'mobile'));
+  const pcRemaining = getRemainingSearchCountFromCounter(getSnapshotCounter(snapshot, 'pc'));
+  const wantsMobile = Boolean(config.mobileMode)
+    && Number(config.mobileSearchCount) > 0
+    && (mobileRemaining === null || Math.min(Number(config.mobileSearchCount), mobileRemaining) > 0);
+  const wantsPc = Number(config.searchCount) > 0
+    && (pcRemaining === null || Math.min(Number(config.searchCount), pcRemaining) > 0);
+
+  return wantsMobile || wantsPc;
 }
 
 function buildRetryBackoffDelayMs(range, retryIndex) {
@@ -941,7 +970,8 @@ async function fetchRewardsDashboard(options = {}) {
   const {
     context = 'dashboard',
     logCounters = false,
-    silent = false
+    silent = false,
+    allowFocusedRecovery = false
   } = options;
 
   let payload;
@@ -960,17 +990,21 @@ async function fetchRewardsDashboard(options = {}) {
   const dashboard = getDashboardFromPayload(payload);
   if (!dashboard) {
     source = 'dashboard_recovery';
-    log('[API] Dashboard payload invalid; reusing one focused Rewards Dashboard tab for recovery.', 'warning');
-    payload = await fetchRewardsDashboardViaTab({
-      active: true,
-      closeAfter: false,
-      settleMs: 4500
-    });
+    if (allowFocusedRecovery) {
+      log('[API] Dashboard payload invalid; reusing one focused Rewards Dashboard tab for recovery.', 'warning');
+      payload = await fetchRewardsDashboardViaTab({
+        active: true,
+        closeAfter: false,
+        settleMs: 4500
+      });
+    } else {
+      log('[API] Background-only Rewards Dashboard recovery failed; not focusing dashboard tab.', 'warning');
+    }
   }
 
   const recoveredDashboard = getDashboardFromPayload(payload);
   if (!recoveredDashboard) {
-    throw new Error('Invalid rewards dashboard payload. Rewards Dashboard recovery tab was opened focused; sign in there, then run again.');
+    throw new Error('Invalid rewards dashboard payload. Background-only Rewards Dashboard recovery failed; sign in to Rewards in Edge, then run again.');
   }
 
   const snapshot = createDashboardSnapshot(recoveredDashboard, source);
@@ -1084,6 +1118,7 @@ function sanitizeConfig(input = {}) {
   merged.waveSize = clamp(parseIntegerWithDefault(merged.waveSize, DEFAULT_CONFIG.waveSize), 0, 20);
   merged.wavePauseMin = clamp(parseIntegerWithDefault(merged.wavePauseMin, DEFAULT_CONFIG.wavePauseMin), 0, 120);
   merged.speedLevel = clamp(parseIntegerWithDefault(merged.speedLevel, DEFAULT_CONFIG.speedLevel), 1, 6);
+  merged.autoRunOnOpen = merged.autoRunOnOpen !== false;
   merged.mobileWindowModeVersion = DEFAULT_CONFIG.mobileWindowModeVersion;
 
   return merged;
@@ -1558,8 +1593,9 @@ async function runSearchAutomation(count, isMobile) {
 
   branch.enabled = isMobile;
   branch.status = 'running';
-  if (initialCounter?.remaining >= 0) {
-    targetCount = Math.min(targetCount, initialCounter.remaining);
+  const remainingSearchCount = getRemainingSearchCountFromCounter(initialCounter);
+  if (remainingSearchCount !== null) {
+    targetCount = Math.min(targetCount, remainingSearchCount);
   }
   branch.planned = targetCount;
   branch.executed = 0;
@@ -1642,7 +1678,7 @@ async function runSearchAutomation(count, isMobile) {
               ? `${label} search ${index}/${targetCount} submitted`
               : `${label} search ${index}/${targetCount} counted`;
             if (branch.counter) {
-              branch.remaining = branch.counter.remaining;
+              branch.remaining = getRemainingSearchCountFromCounter(branch.counter) ?? branch.counter.remaining;
             }
             log(
               acceptBestEffort
@@ -2179,6 +2215,38 @@ function startDailyTasksRun() {
     });
 }
 
+async function maybeAutoStartSearchRun(reason = 'auto') {
+  if (activeRunPromise || state.status === 'running' || state.status === 'cooldown') {
+    return { started: false, reason: 'active' };
+  }
+
+  const config = await getConfig();
+  if (!config.autoRunOnOpen) {
+    return { started: false, reason: 'disabled' };
+  }
+
+  let snapshot = null;
+  try {
+    snapshot = await fetchRewardsDashboard({
+      context: `auto ${reason}`,
+      logCounters: true,
+      allowFocusedRecovery: false
+    });
+  } catch (error) {
+    log(`[Auto] Could not check remaining searches in background: ${error.message}`, 'warning');
+    return { started: false, reason: 'dashboard_unavailable' };
+  }
+
+  if (!hasConfiguredSearchWork(config, snapshot)) {
+    log('[Auto] No remaining search work detected.');
+    return { started: false, reason: 'complete' };
+  }
+
+  log('[Auto] Remaining search work detected; starting background search run.', 'success');
+  startSearchRun();
+  return { started: true, reason: 'remaining_work' };
+}
+
 async function handleCommand(command) {
   switch (command) {
     case 'start_search':
@@ -2244,6 +2312,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         success: true,
         config: await saveConfig(message.config)
       });
+      return;
+    }
+
+    if (message.action === 'maybe_auto_start') {
+      sendResponse(await maybeAutoStartSearchRun(message.reason || 'message'));
       return;
     }
 

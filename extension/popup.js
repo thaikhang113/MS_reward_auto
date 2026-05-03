@@ -67,6 +67,10 @@ const logRenderQueue = [];
 let logFlushFrame = 0;
 let latestState = null;
 
+function isLiveTestPopup() {
+  return new URLSearchParams(window.location.search).has('liveTest');
+}
+
 // ---- SIZE TOGGLE ----
 let isExpanded = false;
 
@@ -101,7 +105,12 @@ async function init() {
     }
 
     const configResponse = await chrome.runtime.sendMessage({ action: 'get_config' });
-    if (configResponse?.config) loadConfig(configResponse.config);
+    if (configResponse?.config) {
+      loadConfig(configResponse.config);
+      if (configResponse.config.autoRunOnOpen && !isLiveTestPopup()) {
+        await chrome.runtime.sendMessage({ action: 'maybe_auto_start', reason: 'popup_open' });
+      }
+    }
   } catch (e) {
     addLogEntry({
       text: 'Extension ready',

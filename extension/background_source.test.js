@@ -21,3 +21,18 @@ test('config sanitizer preserves zero-valued live test controls', () => {
   assert.match(source, /merged\.searchCount = clamp\(parseIntegerWithDefault\(merged\.searchCount, DEFAULT_CONFIG\.searchCount\), 0, 30\)/);
   assert.match(source, /merged\.maxRetries = clamp\(parseIntegerWithDefault\(merged\.maxRetries, DEFAULT_CONFIG\.maxRetries\), 0, 5\)/);
 });
+
+test('auto resume checks remaining search work without focused dashboard recovery', () => {
+  assert.match(source, /autoRunOnOpen:\s*true/);
+  assert.match(source, /function getRemainingSearchCountFromCounter\(/);
+  assert.match(source, /Math\.ceil\(remainingPoints \/ 3\)/);
+  assert.match(source, /async function maybeAutoStartSearchRun\(/);
+  assert.match(source, /allowFocusedRecovery:\s*false/);
+  assert.match(source, /message\.action === 'maybe_auto_start'/);
+});
+
+test('focused dashboard recovery is opt-in only', () => {
+  assert.match(source, /allowFocusedRecovery = false/);
+  assert.match(source, /if \(allowFocusedRecovery\) \{/);
+  assert.match(source, /Background-only Rewards Dashboard recovery failed/);
+});
