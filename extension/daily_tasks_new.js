@@ -15,6 +15,8 @@ const REWARDS_PATH_BLACKLIST = new Set([
   '/welcome',
   '/dashboard',
   '/dashboard/',
+  '/earn',
+  '/earn/',
   '/pointsbreakdown',
   '/starbonusdistribution'
 ]);
@@ -22,6 +24,11 @@ const REWARDS_PATH_BLACKLIST = new Set([
 function toFiniteNumber(value) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function hasRewardsTrackingParams(parsedUrl) {
+  return ['form', 'ocid', 'publ', 'crea'].some((key) => parsedUrl.searchParams.has(key))
+    || /RewardsDO/i.test(parsedUrl.search || '');
 }
 
 export function hasSupportedHost(hostname) {
@@ -69,7 +76,7 @@ export function normalizeTaskUrl(rawUrl) {
     const href = parsedUrl.href.toLowerCase();
 
     if (protocol !== 'http:' && protocol !== 'https:') return null;
-    if (!hasSupportedHost(hostname)) return null;
+    if (!hasSupportedHost(hostname) && !hasRewardsTrackingParams(parsedUrl)) return null;
     if (TASK_URL_BLACKLIST.some((keyword) => href.includes(keyword))) return null;
 
     if ((hostname === 'rewards.bing.com' || hostname.endsWith('.rewards.bing.com'))
@@ -124,6 +131,19 @@ export function getTaskDedupKey(url) {
     if ((hostname === 'www.bing.com' || hostname === 'bing.com') && path === '/search') {
       const query = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
       if (query) {
+        const rewardsOfferId = [
+          parsedUrl.searchParams.get('form'),
+          parsedUrl.searchParams.get('ocid'),
+          parsedUrl.searchParams.get('filters')
+        ]
+          .filter(Boolean)
+          .join('|')
+          .toLowerCase();
+
+        if (rewardsOfferId) {
+          return `${hostname}${path}?q=${query}::${rewardsOfferId}`;
+        }
+
         return `${hostname}${path}?q=${query}`;
       }
     }
@@ -210,5 +230,5 @@ export async function fetchPendingDailyTaskUrls(fetchImpl = fetch) {
   }
 
   const payload = await response.json();
-  return scanUncompletedTasks(payload?.dashboard);
+  return scanUncompletedTasks(payload?.dashboard || payload);
 }

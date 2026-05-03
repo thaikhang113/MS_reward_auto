@@ -1440,11 +1440,119 @@
     return result;
   }
 
+  async function openDashboardTaskLink(targetUrl, options = {}) {
+    if (options.mobile) {
+      applyMobileProfile();
+    }
+
+    const normalizeMatchKey = (rawUrl) => {
+      try {
+        const parsedUrl = new URL(rawUrl);
+        parsedUrl.searchParams.delete('rnoreward');
+        parsedUrl.hash = '';
+
+        const hostname = parsedUrl.hostname.toLowerCase();
+        const path = parsedUrl.pathname.replace(/\/+$/, '').toLowerCase() || '/';
+
+        if (/(\.|^)bing\.com$/i.test(hostname) && path === '/search') {
+          const query = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
+          if (query) {
+            const rewardsOfferId = [
+              parsedUrl.searchParams.get('form'),
+              parsedUrl.searchParams.get('ocid'),
+              parsedUrl.searchParams.get('filters')
+            ]
+              .filter(Boolean)
+              .join('|')
+              .toLowerCase();
+
+            if (rewardsOfferId) {
+              return `${hostname}${path}?q=${query}::${rewardsOfferId}`;
+            }
+
+            return `${hostname}${path}?q=${query}`;
+          }
+        }
+
+        return `${hostname}${path}?${[...parsedUrl.searchParams.entries()]
+          .sort(([leftKey, leftValue], [rightKey, rightValue]) => (
+            leftKey === rightKey
+              ? leftValue.localeCompare(rightValue)
+              : leftKey.localeCompare(rightKey)
+          ))
+          .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+          .join('&')}`;
+      } catch (error) {
+        return String(rawUrl || '').trim().toLowerCase();
+      }
+    };
+
+    const targetKey = normalizeMatchKey(targetUrl);
+    const targetHref = String(targetUrl || '').trim();
+    if (!targetKey || !targetHref) {
+      return { success: false, error: 'missing_target_url' };
+    }
+
+    const findMatchingLink = () => Array.from(document.querySelectorAll('a[href]'))
+      .find((link) => normalizeMatchKey(link.href) === targetKey || link.href === targetHref);
+
+    let link = findMatchingLink();
+    let scans = 0;
+
+    while (!link && scans < 12) {
+      window.scrollBy({ top: randomInt(360, 720), behavior: 'smooth' });
+      await sleep(randomInt(550, 900));
+      link = findMatchingLink();
+      scans += 1;
+    }
+
+    if (!link) {
+      return { success: false, error: 'task_link_not_found', targetKey };
+    }
+
+    link.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    await sleep(randomInt(650, 1100));
+
+    link.setAttribute('target', '_self');
+
+    try {
+      const rect = link.getBoundingClientRect();
+      const clientX = rect.left + Math.max(5, Math.min(rect.width - 5, rect.width / 2));
+      const clientY = rect.top + Math.max(5, Math.min(rect.height - 5, rect.height / 2));
+      const mouseOptions = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX,
+        clientY
+      };
+
+      link.dispatchEvent(new MouseEvent('mouseover', mouseOptions));
+      link.dispatchEvent(new MouseEvent('mousemove', mouseOptions));
+      link.dispatchEvent(new MouseEvent('mousedown', mouseOptions));
+      link.dispatchEvent(new MouseEvent('mouseup', mouseOptions));
+      link.click();
+    } catch (error) {
+      return { success: false, error: 'task_link_click_failed', targetKey };
+    }
+
+    return {
+      success: true,
+      clicked: true,
+      href: link.href,
+      text: getElementText(link).substring(0, 140),
+      targetKey
+    };
+  }
+
   async function collectDashboardTaskLinks(options = {}) {
     if (options.mobile) {
       applyMobileProfile();
     }
 
+    const pagePath = window.location.pathname.toLowerCase();
+    const scanScope = options.scope
+      || (pagePath.startsWith('/dashboard') ? 'daily' : (pagePath.startsWith('/earn/quest/') ? 'quest' : 'earn'));
     const taskLinkSelectors = [
       'mee-rewards-daily-set-item-content a[href]',
       '.ds-card-sec a[href]',
@@ -1452,8 +1560,12 @@
       'a[href][target="_blank"][class*="cursor-pointer"]',
       'a[href*="bing.com"]',
       'a[href*="rewards.bing.com"]',
+      'a[href*="rewards.microsoft.com"]',
       'a[href*="microsoft.com"]',
       'a[href*="msn.com"]',
+      'a[href*="RewardsDO"]',
+      'a[href*="OCID="]',
+      'a[href*="PUBL="]',
       'a[href*="/search?"]',
       'a[href*="quiz"]',
       'a[href*="poll"]'
@@ -1478,11 +1590,18 @@
     const visitedCards = new WeakSet();
     const tasks = [];
     let cardsVisited = 0;
+    const canDismissBlockingUi = !/rewards\.bing\.com$/i.test(window.location.hostname);
+    const pageScanText = getTaskTextSnapshot();
 
+    const hasRewardsTrackingParams = (href) => /[?&](form|ocid|publ|crea)=/i.test(href || '');
     const isSupportedTaskLink = (href) => /^https?:/i.test(href || '')
-      && /bing\.com|rewards\.bing\.com|microsoft\.com|msn\.com/i.test(href || '');
+      && (/bing\.com|rewards\.bing\.com|microsoft\.com|msn\.com/i.test(href || '') || hasRewardsTrackingParams(href));
 
     const findTaskCard = (element) => {
+      if (element?.matches?.('a[href]')) {
+        return element;
+      }
+
       for (const selector of taskCardSelectors) {
         const card = element.closest?.(selector);
         if (card) return card;
@@ -1491,12 +1610,37 @@
       return element.closest?.('a, div, article, section, li') || element;
     };
 
+    const parseTaskRatio = (text) => {
+      const matches = [...String(text || '').matchAll(/(\d+)\s*\/\s*(\d+)\s*tasks?/gi)];
+      if (!matches.length) return null;
+
+      const [, rawCurrent, rawMax] = matches[matches.length - 1];
+      const max = Number(rawMax);
+      let current = Number(rawCurrent);
+
+      if (Number.isFinite(current) && Number.isFinite(max) && current > max && rawCurrent.length > rawMax.length) {
+        current = Number(rawCurrent.slice(-rawMax.length));
+      }
+
+      return Number.isFinite(current) && Number.isFinite(max)
+        ? { current, max }
+        : null;
+    };
+
     const isCompletedTaskCard = (node) => {
       const card = findTaskCard(node);
       const text = getElementText(card);
 
-      if (/completed|done|hoan thanh|da hoan thanh|daily set completed/i.test(text)) {
+      if (
+        /completed|\bdone\b|hoan thanh|da hoan thanh|daily set completed/i.test(text)
+        && !/\bin progress\b|\+\s*\d+|\b0\s*\/\s*\d+\b/i.test(text)
+      ) {
         return true;
+      }
+
+      const taskRatio = parseTaskRatio(text);
+      if (taskRatio) {
+        return taskRatio.current >= taskRatio.max;
       }
 
       return Boolean(card?.querySelector?.(
@@ -1504,10 +1648,72 @@
       ));
     };
 
+    const isLikelyEarnTaskLink = (href, link, card) => {
+      const text = getElementText(card || link);
+      const combined = `${href} ${text}`;
+
+      if (/microsoft\.com\/edge|referandearn|\/redeem\//i.test(href)) return false;
+
+      if (scanScope === 'daily') {
+        return /bing\.com\/search/i.test(href)
+          && /[?&]q=/i.test(href)
+          && /(\+\s*\d+|DailySet|BTDSUOID|dsetqu|tgrew|REWARDSQUIZ_DailySet)/i.test(combined);
+      }
+
+      if (scanScope === 'quest') {
+        if (/rewards\.bing\.com\/earn(?:$|[?#])/i.test(href)) return false;
+        if (/rewards\.microsoft\.com\/dashboard\//i.test(href) && /(activate|click to complete|start here)/i.test(combined)) return true;
+        if (/ML2XME/i.test(href) && /desktop\s*\(([1-9]\d*)\s*\/\s*\d+\s*days complete\)/i.test(pageScanText)) return false;
+        if (/ML2XMF/i.test(href) && /mobile\s*\(([1-9]\d*)\s*\/\s*\d+\s*days complete\)/i.test(pageScanText)) return false;
+        if (/bing\.com\/search/i.test(href) && /[?&]q=/i.test(href) && /(click to complete|start searching|follow|discover|explore|get|search to complete|RewardsDO|OCID|PUBL)/i.test(combined)) return true;
+        if (hasRewardsTrackingParams(href) && /(click to complete|visit|start|follow|discover|explore|learn|watch|RewardsDO|OCID|PUBL)/i.test(combined)) return true;
+        return false;
+      }
+
+      if (/rewards\.bing\.com\/earn\/quest\//i.test(href)) return true;
+      if (/bing\.com\/search/i.test(href) && /[?&]q=/i.test(href) && /(\+\s*\d+|points?|quiz|poll|trivia|challenge|discover|unlock|learn)/i.test(combined)) return true;
+      if (/bing\.com\/images\/create/i.test(href) && /(\+\s*\d+|points?|RewardsDO|OCID|PUBL)/i.test(combined)) return true;
+      if (/aka\.ms\//i.test(href) && /(\+\s*\d+|points?)/i.test(combined)) return true;
+      if (/microsoft\.com|msn\.com/i.test(href) && /(\+\s*\d+|points?|RewardsDO|OCID|PUBL|learn|read|watch)/i.test(combined)) return true;
+
+      return false;
+    };
+
     const collectTaskLinksInDocument = () => {
+      if (scanScope === 'earn') {
+        document.querySelectorAll('a[href*="/earn/quest/"]').forEach((link) => {
+          if (!isVisibleElement(link)) return;
+
+          const text = getElementText(link);
+          const taskRatio = parseTaskRatio(text);
+          if (taskRatio && taskRatio.current >= taskRatio.max) return;
+
+          let sanitizedHref = link.href || '';
+          try {
+            const parsedUrl = new URL(sanitizedHref);
+            parsedUrl.searchParams.delete('rnoreward');
+            parsedUrl.hash = '';
+            sanitizedHref = parsedUrl.toString();
+          } catch (error) {
+            return;
+          }
+
+          if (seen.has(sanitizedHref)) return;
+
+          seen.add(sanitizedHref);
+          tasks.push({
+            url: sanitizedHref,
+            text: text.substring(0, 140),
+            sourceUrl: window.location.href,
+            sourceType: scanScope
+          });
+        });
+      }
+
       taskLinkSelectors.forEach((selector) => {
         document.querySelectorAll(selector).forEach((link) => {
           if (!isVisibleElement(link)) return;
+          if (link.closest?.('header, nav, footer')) return;
 
           let sanitizedHref = link.href || '';
           if (!sanitizedHref) return;
@@ -1524,6 +1730,7 @@
           if (!isSupportedTaskLink(sanitizedHref)) return;
 
           const card = findTaskCard(link);
+          if (!isLikelyEarnTaskLink(sanitizedHref, link, card)) return;
           if (isCompletedTaskCard(card) || isCompletedTaskCard(link)) return;
 
           const dedupKey = sanitizedHref;
@@ -1532,7 +1739,10 @@
           seen.add(dedupKey);
           tasks.push({
             url: dedupKey,
-            text: getElementText(card || link).substring(0, 140)
+            text: getElementText(card || link).substring(0, 140),
+            sourceUrl: window.location.href,
+            sourceType: scanScope,
+            mobile: /ML2XMF/i.test(dedupKey)
           });
         });
       });
@@ -1548,7 +1758,7 @@
       })
       .filter((card) => card.querySelector?.('a[href]'));
 
-    dismissBlockingUi();
+    if (canDismissBlockingUi) dismissBlockingUi();
     await sleep(randomInt(700, 1200));
     window.scrollTo({ top: 0, behavior: 'auto' });
     await sleep(randomInt(500, 900));
@@ -1576,7 +1786,7 @@
           await sleep(randomInt(300, 650));
         }
 
-        dismissBlockingUi();
+        if (canDismissBlockingUi) dismissBlockingUi();
         collectTaskLinksInDocument();
       }
 
@@ -1592,7 +1802,7 @@
         behavior: 'smooth'
       });
       await sleep(randomInt(900, 1600));
-      dismissBlockingUi();
+      if (canDismissBlockingUi) dismissBlockingUi();
       collectTaskLinksInDocument();
       safetyCounter += 1;
     }
@@ -1608,7 +1818,9 @@
 
     return {
       tasks,
-      cardsVisited
+      cardsVisited,
+      sourceType: scanScope,
+      sourceUrl: window.location.href
     };
   }
 
@@ -1622,6 +1834,7 @@
     findSearchInput,
     getEnvironmentSnapshot: collectEnvironmentSnapshot,
     humanTypeString,
+    openDashboardTaskLink,
     prepareEnvironment,
     randomInt,
     runTaskPageInteraction,

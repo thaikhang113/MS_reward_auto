@@ -363,70 +363,150 @@ function hasPendingTaskUrl(pendingUrls, url) {
   return pendingUrls.some((pendingUrl) => getTaskDedupKey(pendingUrl) === taskKey);
 }
 
+function getTaskUrl(task) {
+  return typeof task === 'string' ? task : task?.url;
+}
+
+function getTaskSourceUrl(task) {
+  return typeof task === 'string' ? null : task?.sourceUrl || null;
+}
+
+function isMobileTask(task) {
+  return typeof task === 'object' && Boolean(task?.mobile);
+}
+
+function isRewardsQuestUrl(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.hostname.toLowerCase() === 'rewards.bing.com'
+      && parsedUrl.pathname.toLowerCase().startsWith('/earn/quest/');
+  } catch (error) {
+    return false;
+  }
+}
+
+async function scanTaskSourcePage(sourceUrl, scope) {
+  let tab = null;
+
+  try {
+    tab = await chrome.tabs.create({
+      url: sourceUrl,
+      active: false
+    });
+
+    await waitForTabLoad(tab.id);
+    await waitWithStop(randomInt(1800, 2600));
+
+    const scanResult = await callAutomationMethod(tab.id, 'collectDashboardTaskLinks', [{ mobile: false, scope }]);
+    if (!Array.isArray(scanResult?.tasks)) {
+      throw new Error('collectDashboardTaskLinks returned an invalid payload');
+    }
+
+    return {
+      tasks: scanResult.tasks,
+      cardsVisited: Number(scanResult.cardsVisited || 0)
+    };
+  } finally {
+    if (tab?.id) {
+      await closeTab(tab.id);
+    }
+  }
+}
+
 async function fetchPendingTaskSnapshot() {
   const mergedTasks = new Map();
+  const questSources = new Map();
   let apiError = null;
   let dashboardError = null;
   let apiCount = 0;
   let dashboardCount = 0;
   let dashboardVisitedCards = 0;
-  let dashboardTab = null;
+  let dailyCount = 0;
+  let dailyVisitedCards = 0;
+  let earnCount = 0;
+  let earnVisitedCards = 0;
+  let questCount = 0;
+  let questVisitedCards = 0;
+
+  const addTask = (rawTask, fallbackSourceUrl = null, fallbackSourceType = null) => {
+    const rawUrl = getTaskUrl(rawTask);
+    const normalizedUrl = normalizeTaskUrl(rawUrl);
+    if (!normalizedUrl) return;
+
+    const taskEntry = {
+      url: normalizedUrl,
+      sourceUrl: getTaskSourceUrl(rawTask) || fallbackSourceUrl || new URL('/earn', REWARDS_HOME_URL).toString(),
+      sourceType: rawTask?.sourceType || fallbackSourceType || null,
+      text: rawTask?.text || '',
+      mobile: Boolean(rawTask?.mobile)
+    };
+
+    if (isRewardsQuestUrl(normalizedUrl)) {
+      questSources.set(getTaskDedupKey(normalizedUrl), normalizedUrl);
+      return;
+    }
+
+    mergedTasks.set(getTaskDedupKey(normalizedUrl), taskEntry);
+  };
 
   try {
     const apiUrls = await fetchPendingDailyTaskUrls();
     apiCount = apiUrls.length;
 
     for (const rawUrl of apiUrls) {
-      const normalizedUrl = normalizeTaskUrl(rawUrl);
-      if (!normalizedUrl) continue;
-      mergedTasks.set(getTaskDedupKey(normalizedUrl), normalizedUrl);
+      addTask(rawUrl, new URL('/earn', REWARDS_HOME_URL).toString(), 'api');
     }
   } catch (error) {
     apiError = error;
   }
 
   try {
-    dashboardTab = await chrome.tabs.create({
-      url: new URL('/earn', REWARDS_HOME_URL).toString(),
-      active: false
-    });
+    const dailySourceUrl = new URL('/dashboard', REWARDS_HOME_URL).toString();
+    const dailyResult = await scanTaskSourcePage(dailySourceUrl, 'daily');
+    dailyCount = dailyResult.tasks.length;
+    dailyVisitedCards = dailyResult.cardsVisited;
+    dailyResult.tasks.forEach((task) => addTask(task, dailySourceUrl, 'daily'));
 
-    await waitForTabLoad(dashboardTab.id);
-    await waitWithStop(randomInt(1800, 2600));
+    const earnSourceUrl = new URL('/earn', REWARDS_HOME_URL).toString();
+    const earnResult = await scanTaskSourcePage(earnSourceUrl, 'earn');
+    earnCount = earnResult.tasks.length;
+    earnVisitedCards = earnResult.cardsVisited;
+    earnResult.tasks.forEach((task) => addTask(task, earnSourceUrl, 'earn'));
 
-    const dashboardResult = await callAutomationMethod(dashboardTab.id, 'collectDashboardTaskLinks', [{ mobile: false }]);
-    if (!Array.isArray(dashboardResult?.tasks)) {
-      throw new Error('collectDashboardTaskLinks returned an invalid payload');
+    for (const questUrl of questSources.values()) {
+      const questResult = await scanTaskSourcePage(questUrl, 'quest');
+      questCount += questResult.tasks.length;
+      questVisitedCards += questResult.cardsVisited;
+      questResult.tasks.forEach((task) => addTask(task, questUrl, 'quest'));
     }
 
-    dashboardCount = dashboardResult.tasks.length;
-    dashboardVisitedCards = Number(dashboardResult.cardsVisited || 0);
-
-    for (const task of dashboardResult.tasks) {
-      const normalizedUrl = normalizeTaskUrl(task?.url || task);
-      if (!normalizedUrl) continue;
-      mergedTasks.set(getTaskDedupKey(normalizedUrl), normalizedUrl);
-    }
+    dashboardCount = dailyCount + earnCount + questCount;
+    dashboardVisitedCards = dailyVisitedCards + earnVisitedCards + questVisitedCards;
   } catch (error) {
     dashboardError = error;
-  } finally {
-    if (dashboardTab?.id) {
-      await closeTab(dashboardTab.id);
-    }
   }
 
   if (!mergedTasks.size && apiError && dashboardError) {
     throw new Error(`Unable to load dashboard tasks: ${dashboardError.message}; API fallback failed: ${apiError.message}`);
   }
 
-  const pendingUrls = [...mergedTasks.values()];
+  const pendingTasks = [...mergedTasks.values()]
+    .sort((leftTask, rightTask) => Number(Boolean(leftTask.mobile)) - Number(Boolean(rightTask.mobile)));
+  const pendingUrls = pendingTasks.map((task) => task.url);
   return {
+    pendingTasks,
     pendingUrls,
     pendingKeys: new Set(pendingUrls.map((url) => getTaskDedupKey(url))),
     sources: {
       apiCount,
       dashboardCount,
       dashboardVisitedCards,
+      dailyCount,
+      dailyVisitedCards,
+      earnCount,
+      earnVisitedCards,
+      questCount,
+      questVisitedCards,
       apiError: apiError?.message || null,
       dashboardError: dashboardError?.message || null
     }
@@ -598,6 +678,15 @@ async function fetchRewardsDashboardViaTab() {
       target: { tabId: tab.id },
       world: AUTOMATION_WORLD,
       func: async (apiUrl) => {
+        const scrapeVisiblePoints = () => {
+          const text = document.body?.innerText || '';
+          const match = text.match(/Available points\s+([\d,.\s]+)/i);
+          if (!match) return null;
+
+          const value = Number.parseInt(match[1].replace(/[^\d]/g, ''), 10);
+          return Number.isFinite(value) ? value : null;
+        };
+
         const response = await fetch(apiUrl, {
           cache: 'no-store',
           credentials: 'include',
@@ -607,10 +696,34 @@ async function fetchRewardsDashboardViaTab() {
         });
 
         if (!response.ok) {
+          const visiblePoints = scrapeVisiblePoints();
+          if (Number.isFinite(visiblePoints)) {
+            return {
+              userStatus: {
+                availablePoints: visiblePoints,
+                counters: {}
+              }
+            };
+          }
+
           throw new Error(`HTTP ${response.status}`);
         }
 
-        return response.json();
+        try {
+          return await response.json();
+        } catch (error) {
+          const visiblePoints = scrapeVisiblePoints();
+          if (Number.isFinite(visiblePoints)) {
+            return {
+              userStatus: {
+                availablePoints: visiblePoints,
+                counters: {}
+              }
+            };
+          }
+
+          throw error;
+        }
       },
       args: [REWARDS_API_URL]
     });
@@ -1292,14 +1405,114 @@ async function verifyTaskCompletion(url) {
   };
 }
 
-async function runTaskVisit(url) {
-  let tab = null;
+function taskTabMatchesUrl(tabUrl, targetUrl) {
+  const normalizedTabUrl = normalizeTaskUrl(tabUrl);
+  if (!normalizedTabUrl) return false;
+
+  return getTaskDedupKey(normalizedTabUrl) === getTaskDedupKey(targetUrl);
+}
+
+function stripUrlHash(url) {
+  try {
+    const parsedUrl = new URL(url);
+    parsedUrl.hash = '';
+    return parsedUrl.toString();
+  } catch (error) {
+    return String(url || '');
+  }
+}
+
+async function waitForClickedTaskTab(dashboardTabId, targetUrl, knownTabIds, sourceUrl = null) {
+  const deadline = Date.now() + 18000;
+  const normalizedSourceUrl = sourceUrl ? stripUrlHash(sourceUrl) : null;
+
+  while (Date.now() < deadline) {
+    const tabs = await chrome.tabs.query({});
+    const dashboardTab = tabs.find((tab) => tab.id === dashboardTabId);
+
+    if (dashboardTab?.url && taskTabMatchesUrl(dashboardTab.url, targetUrl)) {
+      return dashboardTab;
+    }
+
+    if (
+      dashboardTab?.url
+      && normalizedSourceUrl
+      && stripUrlHash(dashboardTab.url) !== normalizedSourceUrl
+      && !/^chrome:|^edge:/i.test(dashboardTab.url)
+    ) {
+      return dashboardTab;
+    }
+
+    const matchedTab = tabs.find((tab) => {
+      if (!tab?.id || tab.id === dashboardTabId) return false;
+      if (!tab.url || !taskTabMatchesUrl(tab.url, targetUrl)) return false;
+      return tab.openerTabId === dashboardTabId || !knownTabIds.has(tab.id);
+    });
+
+    if (matchedTab) {
+      return matchedTab;
+    }
+
+    await waitWithStop(500);
+  }
+
+  return null;
+}
+
+async function openTaskViaRewardsDashboard(task) {
+  const url = getTaskUrl(task);
+  const sourceUrl = getTaskSourceUrl(task) || new URL('/earn', REWARDS_HOME_URL).toString();
+  const knownTabs = await chrome.tabs.query({});
+  const knownTabIds = new Set(knownTabs.map((tab) => tab.id).filter(Boolean));
+  const dashboardTab = await chrome.tabs.create({
+    url: sourceUrl,
+    active: true
+  });
 
   try {
-    tab = await chrome.tabs.create({
-      url,
-      active: true
-    });
+    try {
+      await chrome.windows.update(dashboardTab.windowId, { focused: true });
+    } catch (error) {}
+
+    await waitForTabLoad(dashboardTab.id);
+    await waitWithStop(randomInt(1800, 2600));
+
+    const clickResult = await callAutomationMethod(dashboardTab.id, 'openDashboardTaskLink', [url, { mobile: isMobileTask(task) }]);
+    if (!clickResult?.success) {
+      throw new Error(clickResult?.error || 'task_link_click_failed');
+    }
+
+    const taskTab = await waitForClickedTaskTab(dashboardTab.id, url, knownTabIds, sourceUrl);
+    if (!taskTab?.id) {
+      log('[Tasks] Rewards card did not open a new task page; verifying click-through in place.', 'warning');
+      return { dashboardTab, taskTab: dashboardTab, clickResult };
+    }
+
+    log(`[Tasks] Clicked Rewards card: ${clickResult.text || clickResult.href || url}`);
+    return { dashboardTab, taskTab, clickResult };
+  } catch (error) {
+    if (dashboardTab?.id) {
+      await closeTab(dashboardTab.id);
+    }
+    throw error;
+  }
+}
+
+async function runTaskVisit(task) {
+  const url = getTaskUrl(task);
+  const taskUsesMobile = isMobileTask(task);
+  let tab = null;
+  let dashboardTab = null;
+
+  try {
+    if (taskUsesMobile) {
+      await setMobileMode(true);
+    }
+
+    const openedTask = await openTaskViaRewardsDashboard(task);
+    dashboardTab = openedTask.dashboardTab;
+    tab = openedTask.taskTab;
+
     try {
       await chrome.windows.update(tab.windowId, { focused: true });
     } catch (error) {}
@@ -1311,7 +1524,23 @@ async function runTaskVisit(url) {
     let taskResult = null;
 
     for (let pass = 1; pass <= TASK_INTERACTION_PASS_LIMIT; pass += 1) {
-      taskResult = await callAutomationMethod(tab.id, 'runTaskPageInteraction', [{ mobile: false }]);
+      try {
+        taskResult = await callAutomationMethod(tab.id, 'runTaskPageInteraction', [{ mobile: taskUsesMobile }]);
+      } catch (error) {
+        const message = String(error?.message || error || '');
+        if (/Cannot access|Missing host permission|host permissions|The extensions gallery cannot be scripted|chrome:\/\//i.test(message)) {
+          taskResult = {
+            success: true,
+            mode: 'external',
+            clicked: [],
+            answersClicked: 0
+          };
+          log('[Tasks] Task page is outside extension host permissions; using click-through dwell only.', 'warning');
+          break;
+        }
+
+        throw error;
+      }
 
       if (taskResult?.success) {
         break;
@@ -1342,9 +1571,15 @@ async function runTaskVisit(url) {
     await waitWithStop(dwellMs);
     return taskResult;
   } finally {
-    if (tab?.id) {
+    if (tab?.id && tab.id !== dashboardTab?.id) {
       await closeTab(tab.id);
       await waitWithStop(10000);
+    }
+    if (dashboardTab?.id) {
+      await closeTab(dashboardTab.id);
+    }
+    if (taskUsesMobile) {
+      await setMobileMode(false);
     }
   }
 }
@@ -1374,7 +1609,8 @@ async function runDailyTasksAutomation() {
 
   try {
     const initialSnapshot = await fetchPendingTaskSnapshot();
-    const taskUrls = initialSnapshot.pendingUrls;
+    const taskEntries = initialSnapshot.pendingTasks || initialSnapshot.pendingUrls.map((url) => ({ url }));
+    const taskUrls = taskEntries.map((task) => task.url);
     const sourceSummary = initialSnapshot.sources || {};
     let latestPendingUrls = [...taskUrls];
     state.tasks.planned = taskUrls.length;
@@ -1392,7 +1628,7 @@ async function runDailyTasksAutomation() {
       log(`[Tasks] API fallback warning: ${sourceSummary.apiError}`, 'warning');
     }
     log(
-      `[Tasks] Dashboard scan found ${sourceSummary.dashboardCount || 0} URL(s) across ${sourceSummary.dashboardVisitedCards || 0} card(s); API reported ${sourceSummary.apiCount || 0}.`
+      `[Tasks] Task scan found ${sourceSummary.dashboardCount || 0} URL(s) across ${sourceSummary.dashboardVisitedCards || 0} card(s): daily ${sourceSummary.dailyCount || 0}, earn ${sourceSummary.earnCount || 0}, quest ${sourceSummary.questCount || 0}; API reported ${sourceSummary.apiCount || 0}.`
     );
 
     if (taskUrls.length === 0) {
@@ -1410,7 +1646,8 @@ async function runDailyTasksAutomation() {
     for (let index = 0; index < taskUrls.length; index += 1) {
       assertNotStopped();
 
-      const url = taskUrls[index];
+      const task = taskEntries[index];
+      const url = getTaskUrl(task);
       if (!hasPendingTaskUrl(latestPendingUrls, url)) {
         state.tasks.completed = Math.max(state.tasks.completed, state.tasks.planned - latestPendingUrls.length);
         state.tasks.executed = state.tasks.completed;
@@ -1420,15 +1657,16 @@ async function runDailyTasksAutomation() {
         log(`[Tasks] Skipping already-cleared task ${index + 1}/${taskUrls.length}.`);
       } else {
         let taskCompleted = false;
+        const maxAttempts = isMobileTask(task) ? 1 : MAX_TASK_ATTEMPTS;
 
-        for (let attempt = 1; attempt <= MAX_TASK_ATTEMPTS; attempt += 1) {
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
           state.tasks.lastOutcome = `Opening task ${index + 1}/${taskUrls.length}${attempt > 1 ? ` retry ${attempt - 1}` : ''}`;
           syncTaskState();
           // Anti-ban: luôn xử lý tuần tự từng tab một, không mở đồng thời nhiều task để tránh bị đánh dấu spam.
           log(`[Tasks] Opening ${index + 1}/${taskUrls.length}${attempt > 1 ? ` retry ${attempt - 1}` : ''}: ${url}`);
 
           try {
-            await runTaskVisit(url);
+            await runTaskVisit(task);
             const verification = await verifyTaskCompletion(url);
             latestPendingUrls = verification.pendingUrls;
             state.tasks.pending = latestPendingUrls.length;
@@ -1447,12 +1685,28 @@ async function runDailyTasksAutomation() {
             syncTaskState();
             log(`[Tasks] Task ${index + 1} was not removed from the pending list after attempt ${attempt}.`, 'warning');
           } catch (error) {
+            try {
+              const verification = await verifyTaskCompletion(url);
+              latestPendingUrls = verification.pendingUrls;
+              state.tasks.pending = latestPendingUrls.length;
+
+              if (verification.completed) {
+                taskCompleted = true;
+                state.tasks.completed = Math.max(state.tasks.completed + 1, state.tasks.planned - latestPendingUrls.length);
+                state.tasks.executed = state.tasks.completed;
+                state.tasks.lastOutcome = `Completed task ${index + 1}/${taskUrls.length}`;
+                syncTaskState();
+                log(`[Tasks] Task ${index + 1} verified after click fallback.`, 'success');
+                break;
+              }
+            } catch (verificationError) {}
+
             state.tasks.lastOutcome = `Task ${index + 1}/${taskUrls.length} failed`;
             syncTaskState();
             log(`[Tasks] Task ${index + 1} attempt ${attempt} failed: ${error.message}`, 'warning');
           }
 
-          if (attempt < MAX_TASK_ATTEMPTS) {
+          if (attempt < maxAttempts) {
             const retryDelayMs = buildRetryBackoffDelayMs(TASK_RETRY_BACKOFF_MS, attempt - 1);
             log(`[Tasks] Retry backoff ${Math.round(retryDelayMs / 1000)}s before opening a fresh task tab.`, 'warning');
             await waitWithStop(retryDelayMs);
