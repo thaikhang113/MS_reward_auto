@@ -1,163 +1,64 @@
-🚀 README.md (Final Version)
-<div align="center">
-  <img src="https://raw.githubusercontent.com/buoi2k7/Reward_Bing_VN/main/extension/icons/icon-128.png" width="120" alt="Extension Icon">
-  
-  <h1>🤖 Microsoft Rewards Auto (API Edition)</h1>
-  
-  <p><b>Automation tool giúp tự động thu thập điểm Microsoft Rewards bằng cách gọi API trực tiếp — ổn định, nhanh và khó bị phá vỡ.</b></p>
+# Microsoft Rewards Auto
 
-  <br/>
+Chrome/Edge extension tu dong chay Microsoft Rewards searches va daily tasks.
 
-  [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-  [![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)](https://www.javascript.com/)
-  ![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=google-chrome)
-  ![Status](https://img.shields.io/badge/Status-Active-brightgreen)
+## Tinh nang
 
-</div>
+- PC search va mobile search.
+- Mobile search gia lap bang UA rules, touch/viewport mobile trong content script.
+- Lay keyword chinh tu Google Trends Viet Nam.
+- Neu Rewards API tra payload loi, extension tu mo/reuse Rewards Dashboard de recovery.
+- Gioi han tab extension quan ly toi da 2 tab, tab moi tao o background (`active: false`) de khong cuop focus khi ban dang lam viec.
+- Doc diem/counter tu Rewards API khi co the, fallback sang dashboard recovery khi API khong on dinh.
+- Scan Daily Set, punch card, promotions, task link tu Rewards dashboard.
 
----
+## Cai dat
 
-## 📋 Mục lục
-
-- [🚀 Giới thiệu](#-giới-thiệu)
-- [🔥 Tại sao project này đáng chú ý](#-tại-sao-project-này-đáng-chú-ý)
-- [🎯 Tính năng](#-tính-năng)
-- [📦 Yêu cầu](#-yêu-cầu)
-- [🛠 Cài đặt](#-cài-đặt)
-- [🚀 Cách sử dụng](#-cách-sử-dụng)
-- [🔍 Cách hoạt động](#-cách-hoạt-động)
-- [🧠 Kiến trúc hệ thống](#-kiến-trúc-hệ-thống)
-- [⚠️ Rủi ro & Lưu ý](#️-rủi-ro--lưu-ý)
-- [📞 Liên hệ](#-liên-hệ)
-
----
-
-## 🚀 Giới thiệu
-
-**Microsoft Rewards Auto** là tiện ích Chrome giúp tự động hóa việc thu thập điểm Microsoft Rewards mỗi ngày.
-
-Khác với các tool truyền thống dùng **DOM Scraping (dễ bị lỗi khi UI thay đổi)**, project này:
-
-- ⚡ Gọi API trực tiếp từ server
-- 🛡️ Hoạt động ổn định hơn
-- 🚀 Nhanh và chính xác hơn
-- 🤖 Tự động hoàn thành nhiệm vụ khi bạn không cần thao tác
-
----
-
-## 🔥 Tại sao project này đáng chú ý
-
-- Hầu hết tool ngoài kia phụ thuộc giao diện → rất dễ "toang"
-- Project này dùng API → ít bị ảnh hưởng bởi thay đổi UI
-- Có thể mở rộng thành hệ thống automation lớn hơn
-- Tư duy hướng backend thay vì UI hack
-
-👉 Đây không chỉ là tool, mà là nền tảng automation.
-
----
-
-## 🎯 Tính năng
-
-### 🔧 Tính năng chính
-
-- 🔌 **Gọi API trực tiếp**
-- 📋 **Hỗ trợ nhiều loại nhiệm vụ**:
-  - Daily Set
-  - Web Search (PC/Mobile)
-  - Punch Cards
-  - Promotions
-- ⏱️ **Delay ngẫu nhiên (2–8s)** tránh bị phát hiện
-- 🗑️ **Loại bỏ popup gây nhiễu**
-- 🌙 **Dark mode UI**
-- 📊 **Theo dõi tiến độ điểm**
-
----
-
-## 📦 Yêu cầu
-
-- 🌐 Chrome / Edge (v90+)
-- 👤 Tài khoản Microsoft Rewards
-- 🌍 Internet
-
----
-
-## 🛠 Cài đặt
-
-### Cách 1: Load Extension (Khuyên dùng)
+1. Clone repo:
 
 ```bash
-git clone https://github.com/buoi2k7/Reward_Bing_VN.git
-cd Reward_Bing_VN
-Mở chrome://extensions/
-Bật Developer mode
-Click Load unpacked
-Chọn thư mục extension
-🚀 Cách sử dụng
-Đăng nhập Microsoft Rewards
-Mở extension
-Bấm Start
-Theo dõi tiến trình
-Ngồi chill 😎
-🔍 Cách hoạt động
-1. Call API /getuserinfo
-   ↓
-2. Lấy danh sách task
-   ↓
-3. Xử lý từng task
-   ↓
-4. Delay random (2–8s)
-   ↓
-5. Update điểm
-🧠 Kiến trúc hệ thống
-Background Script
-Điều phối toàn bộ logic
-Content Script
-Tương tác với trang web
-API Handler
-Gửi request đến Microsoft
-Task Scheduler
-Quản lý delay & thứ tự task
+git clone https://github.com/thaikhang113/MS_reward_auto.git
+```
 
-👉 Thiết kế theo hướng modular → dễ mở rộng
+2. Mo `edge://extensions` hoac `chrome://extensions`.
+3. Bat `Developer mode`.
+4. Chon `Load unpacked`.
+5. Chon thu muc `extension`.
+6. Dang nhap Microsoft Rewards trong cung profile trinh duyet.
 
-⚠️ Rủi ro & Lưu ý
-Có thể vi phạm điều khoản Microsoft Rewards
-Có khả năng bị giới hạn hoặc khóa tài khoản
-Dùng với mục đích học tập / nghiên cứu
+## Cach dung
 
-👉 Bạn tự chịu trách nhiệm khi sử dụng
----
+1. Bam icon extension.
+2. Chon so luong PC/mobile searches.
+3. Bam Start.
+4. De trinh duyet mo trong qua trinh chay.
 
-## 🛣️ Roadmap
+Neu log bao dashboard payload invalid, extension se mo/reuse mot tab Rewards Dashboard o background. Neu chua dang nhap, vao tab do dang nhap roi chay lai.
 
-Dự án vẫn đang phát triển và sẽ được nâng cấp thêm:
+## Nguon du lieu
 
-- [ ] Hỗ trợ Firefox (WebExtension API)
-- [ ] Multi-account (chạy nhiều tài khoản cùng lúc)
-- [ ] Proxy integration (tránh bị rate limit)
-- [ ] Dashboard thống kê điểm (UI riêng)
-- [ ] Auto scheduler (chạy theo giờ định sẵn)
-- [ ] Log system (ghi lại hoạt động chi tiết)
+- Microsoft Rewards dashboard: `https://rewards.bing.com/`
+- Microsoft Rewards user info API: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest`
+- Bing Search: `https://www.bing.com/`
+- Google Trends page: `https://trends.google.com/trending?geo=VN&hl=vi`
+- Google Trends RPC endpoint observed from Trends page network: `https://trends.google.com/_/TrendsUi/data/batchexecute?rpcids=i0OFE&source-path=%2Ftrending&hl=vi&rt=c`
 
----
+## Cau truc
 
-## 🤝 Đóng góp
+- `extension/background.js`: dieu phoi search, task, Rewards API, dashboard recovery.
+- `extension/content-automation.js`: thao tac DOM tren Bing/Rewards/task pages.
+- `extension/keywords-data.js`: keyword pool, dynamic keywords, Google Trends fetch.
+- `extension/rewards_dashboard.js`: normalize dashboard payload/counters.
+- `extension/daily_tasks_new.js`: lay va normalize task URL.
+- `extension/tab_policy.js`: gioi han/reuse tab extension quan ly.
 
-Mọi đóng góp đều được hoan nghênh.
+## Kiem thu
 
-Cách tham gia:
+```bash
+cd extension
+node --test daily_tasks_new.test.js rewards_dashboard.test.js keywords-data.test.js tab_policy.test.js
+```
 
-1. Fork repository  
-2. Tạo branch mới  
-   ```bash
-   git checkout -b feature/ten-tinh-nang
+## Luu y
 
-📞 Liên hệ
-👨‍💻 GitHub: https://github.com/buoi2k7
-📧 Email: ngthanhduy132@gmail.com
-📱 Phone: 0337155246
-<div align="center">
-
-⭐ Nếu thấy hay thì cho 1 star nhé ⭐
-
-</div> ```
+Tool nay tu dong hoa thao tac tren Microsoft Rewards. Hay tu kiem tra dieu khoan Microsoft Rewards va tu chiu trach nhiem khi su dung.

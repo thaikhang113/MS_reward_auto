@@ -1,6 +1,7 @@
-const GOOGLE_TRENDS_ENDPOINT = 'https://trends.google.com/_/TrendsUi/data/batchexecute';
+const GOOGLE_TRENDS_ENDPOINT = 'https://trends.google.com/_/TrendsUi/data/batchexecute?rpcids=i0OFE&source-path=%2Ftrending&hl=vi&rt=c';
 const GOOGLE_TRENDS_RPC_ID = 'i0OFE';
 const GOOGLE_TRENDS_REGION = 'VN';
+const GOOGLE_TRENDS_LANGUAGE = 'vi';
 const GOOGLE_TRENDS_TIMEOUT_MS = 15000;
 const KEYWORD_CACHE_TTL_MS = 30 * 60 * 1000;
 
@@ -147,11 +148,11 @@ function dedupeKeywords(items) {
   return keywords;
 }
 
-function buildTrendsRequest(region = GOOGLE_TRENDS_REGION) {
+export function buildTrendsRequest(region = GOOGLE_TRENDS_REGION, language = GOOGLE_TRENDS_LANGUAGE) {
   const params = new URLSearchParams();
   params.append(
     'f.req',
-    JSON.stringify([[[GOOGLE_TRENDS_RPC_ID, JSON.stringify([null, null, region, 0, null, 2])]]])
+    JSON.stringify([[[GOOGLE_TRENDS_RPC_ID, JSON.stringify([null, null, region, 0, language, 24, 1]), null, 'generic']]])
   );
   return params.toString();
 }
@@ -189,7 +190,7 @@ function extractBatchedPayload(text) {
   return JSON.parse(payloadLine);
 }
 
-function parseTrendingKeywordsFromPayload(payload) {
+export function parseTrendingKeywordsFromPayload(payload) {
   const rpcResult = payload.find(
     (entry) =>
       Array.isArray(entry)
@@ -208,10 +209,14 @@ function parseTrendingKeywordsFromPayload(payload) {
   for (const topic of topics) {
     if (!Array.isArray(topic)) continue;
 
-    collected.push(topic[0], topic[topic.length - 1]);
+    collected.push(topic[0]);
 
     if (Array.isArray(topic[9])) {
       collected.push(...topic[9]);
+    }
+
+    if (!topic[0] && typeof topic[topic.length - 1] === 'string') {
+      collected.push(topic[topic.length - 1]);
     }
   }
 
@@ -333,9 +338,9 @@ export async function fetchTrendingKeywords(options = {}) {
       Accept: '*/*',
       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
       Origin: 'https://trends.google.com',
-      Referer: 'https://trends.google.com/trends/'
+      Referer: `https://trends.google.com/trending?geo=${encodeURIComponent(region)}&hl=${encodeURIComponent(GOOGLE_TRENDS_LANGUAGE)}`
     },
-    body: buildTrendsRequest(region)
+    body: buildTrendsRequest(region, GOOGLE_TRENDS_LANGUAGE)
   });
 
   const payload = extractBatchedPayload(text);

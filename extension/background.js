@@ -1,6 +1,7 @@
 import { fetchPendingDailyTaskUrls, getTaskDedupKey, normalizeTaskUrl } from './daily_tasks_new.js';
 import { getAllKeywords } from './keywords-data.js';
 import { getDashboardFromPayload, normalizeRewardsCounter } from './rewards_dashboard.js';
+import { planManagedTabOpen } from './tab_policy.js';
 
 const DEFAULT_CONFIG = Object.freeze({
   rewardsLevel: 'gold',
@@ -145,6 +146,8 @@ let activeRunPromise = null;
 let initPromise = null;
 let persistInFlight = null;
 let persistDirty = false;
+let rewardsDashboardRecoveryTabId = null;
+const managedTabIds = new Set();
 
 function getPublicState() {
   return JSON.parse(JSON.stringify(state));
@@ -390,10 +393,7 @@ async function scanTaskSourcePage(sourceUrl, scope) {
   let tab = null;
 
   try {
-    tab = await chrome.tabs.create({
-      url: sourceUrl,
-      active: false
-    });
+    tab = await openManagedTab(sourceUrl, { active: false });
 
     await waitForTabLoad(tab.id);
     await waitWithStop(randomInt(1800, 2600));
@@ -672,16 +672,10 @@ async function fetchRewardsDashboardViaTab(options = {}) {
   let tab = null;
 
   try {
-    tab = await chrome.tabs.create({
-      url: REWARDS_HOME_URL,
-      active
+    tab = await openManagedTab(REWARDS_HOME_URL, {
+      active,
+      purpose: closeAfter ? 'generic' : 'dashboard'
     });
-
-    if (active) {
-      try {
-        await chrome.windows.update(tab.windowId, { focused: true });
-      } catch (error) {}
-    }
 
     await waitForTabLoad(tab.id);
     await waitWithStop(settleMs);
@@ -845,10 +839,10 @@ async function fetchRewardsDashboard(options = {}) {
 
   const dashboard = getDashboardFromPayload(payload);
   if (!dashboard) {
-    source = 'visible_dashboard_recovery';
-    log('[API] Dashboard payload invalid; opening Rewards Dashboard in browser for recovery.', 'warning');
+    source = 'dashboard_recovery';
+    log('[API] Dashboard payload invalid; reusing one background Rewards Dashboard tab for recovery.', 'warning');
     payload = await fetchRewardsDashboardViaTab({
-      active: true,
+      active: false,
       closeAfter: false,
       settleMs: 4500
     });
@@ -856,7 +850,7 @@ async function fetchRewardsDashboard(options = {}) {
 
   const recoveredDashboard = getDashboardFromPayload(payload);
   if (!recoveredDashboard) {
-    throw new Error('Invalid rewards dashboard payload. Rewards Dashboard was opened; sign in there, then run again.');
+    throw new Error('Invalid rewards dashboard payload. Rewards Dashboard recovery tab was opened in background; sign in there, then run again.');
   }
 
   const snapshot = createDashboardSnapshot(recoveredDashboard, source);
@@ -1102,9 +1096,56 @@ async function getTabSafely(tabId) {
 async function closeTab(tabId) {
   if (!Number.isInteger(tabId)) return;
 
+  managedTabIds.delete(tabId);
+  if (tabId === rewardsDashboardRecoveryTabId) {
+    rewardsDashboardRecoveryTabId = null;
+  }
+
   try {
     await chrome.tabs.remove(tabId);
   } catch (error) {}
+}
+
+async function openManagedTab(url, options = {}) {
+  const {
+    active = false,
+    purpose = 'generic',
+    preferredDashboardTabId = rewardsDashboardRecoveryTabId
+  } = options;
+  const tabs = await chrome.tabs.query({});
+  const plan = planManagedTabOpen({
+    tabs,
+    trackedTabIds: Array.from(managedTabIds),
+    preferredDashboardTabId,
+    purpose,
+    url
+  });
+
+  for (const tabId of plan.closeTabIds || []) {
+    await closeTab(tabId);
+  }
+
+  let tab = null;
+  if (plan.action === 'update') {
+    try {
+      tab = await chrome.tabs.update(plan.tabId, { url, active });
+    } catch (error) {
+      tab = null;
+    }
+  }
+
+  if (!tab) {
+    tab = await chrome.tabs.create({ url, active });
+  }
+
+  if (tab?.id) {
+    managedTabIds.add(tab.id);
+    if (purpose === 'dashboard') {
+      rewardsDashboardRecoveryTabId = tab.id;
+    }
+  }
+
+  return tab;
 }
 
 async function waitForTabLoad(tabId, timeoutMs = TAB_LOAD_TIMEOUT_MS) {
@@ -1222,10 +1263,7 @@ async function runSingleSearch(keyword, isMobile) {
   let tab = null;
 
   try {
-    tab = await chrome.tabs.create({
-      url: BING_HOME_URL,
-      active: false
-    });
+    tab = await openManagedTab(BING_HOME_URL, { active: false });
 
     await waitForTabLoad(tab.id);
     await waitWithStop(randomInt(...SEARCH_READY_DELAY_MS));
@@ -1473,16 +1511,9 @@ async function openTaskViaRewardsDashboard(task) {
   const sourceUrl = getTaskSourceUrl(task) || new URL('/earn', REWARDS_HOME_URL).toString();
   const knownTabs = await chrome.tabs.query({});
   const knownTabIds = new Set(knownTabs.map((tab) => tab.id).filter(Boolean));
-  const dashboardTab = await chrome.tabs.create({
-    url: sourceUrl,
-    active: true
-  });
+  const dashboardTab = await openManagedTab(sourceUrl, { active: false });
 
   try {
-    try {
-      await chrome.windows.update(dashboardTab.windowId, { focused: true });
-    } catch (error) {}
-
     await waitForTabLoad(dashboardTab.id);
     await waitWithStop(randomInt(1800, 2600));
 
@@ -1522,12 +1553,8 @@ async function runTaskVisit(task) {
     dashboardTab = openedTask.dashboardTab;
     tab = openedTask.taskTab;
 
-    try {
-      await chrome.windows.update(tab.windowId, { focused: true });
-    } catch (error) {}
-
     await waitForTabLoad(tab.id);
-    // Human-like tab focus: doi 2-3 giay sau khi load xong roi moi bat dau inject va tuong tac.
+    // Background dwell: wait after load before injecting interactions.
     await waitWithStop(randomInt(2000, 3000));
 
     let taskResult = null;
