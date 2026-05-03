@@ -11,6 +11,8 @@
     "declarativeNetRequest"
   ],
   "host_permissions": [
+    "https://*/*",
+    "http://*/*",
     "https://*.bing.com/*",
     "https://*.msn.com/*",
     "https://*.microsoft.com/*",

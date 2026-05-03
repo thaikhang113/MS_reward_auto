@@ -491,26 +491,20 @@
     return { success: true, submitted: true };
   }
 
-  async function enhancedSearchInteraction(options = {}) {
-    if (options.mobile) {
-      applyMobileProfile();
-    }
-
+  async function runVisibleScrollSequence(options = {}) {
+    const mobile = Boolean(options.mobile);
+    const minBaseStep = mobile ? 130 : 90;
+    const maxBaseStep = mobile ? 360 : 260;
+    const sequenceLength = options.steps || randomInt(mobile ? 7 : 5, mobile ? 12 : 8);
     const scrollPlan = [];
-    const maxBaseStep = options.mobile ? 320 : 260;
-    const minBaseStep = options.mobile ? 110 : 90;
-    const sequenceLength = randomInt(options.mobile ? 6 : 5, options.mobile ? 10 : 8);
-
-    dismissBlockingUi();
-    await sleep(randomInt(options.mobile ? 1400 : 900, options.mobile ? 2400 : 1700));
 
     for (let index = 0; index < sequenceLength; index += 1) {
       let direction = 1;
-      if (index > 1 && Math.random() < 0.35) {
+      if (index > 1 && Math.random() < (mobile ? 0.45 : 0.35)) {
         direction = -1;
       }
 
-      if (index > 3 && Math.random() < 0.2) {
+      if (index > 3 && Math.random() < 0.25) {
         direction = 1;
       }
 
@@ -523,21 +517,82 @@
         behavior: 'smooth'
       });
 
-      await sleep(randomInt(options.mobile ? 550 : 500, options.mobile ? 1200 : 1000));
+      await sleep(randomInt(mobile ? 650 : 500, mobile ? 1350 : 1000));
 
-      if (Math.random() < 0.45) {
+      if (Math.random() < 0.5) {
         window.scrollBy({
-          top: randomInt(-35, 35),
+          top: randomInt(-45, 45),
           behavior: 'auto'
         });
       }
 
-      if (Math.random() < 0.5) {
+      if (Math.random() < 0.55) {
         dismissBlockingUi();
       }
 
-      await sleep(randomInt(options.mobile ? 300 : 250, options.mobile ? 850 : 700));
+      await sleep(randomInt(mobile ? 350 : 250, mobile ? 950 : 700));
     }
+
+    return scrollPlan.length;
+  }
+
+  function findSearchResultAnchor() {
+    const anchors = Array.from(document.querySelectorAll('#b_results h2 a[href], #b_results a[href], main a[href], article a[href]'));
+
+    return anchors.find((anchor) => {
+      if (!isInteractableElement(anchor)) return false;
+      if (!/^https?:/i.test(anchor.href || '')) return false;
+
+      const label = getElementText(anchor);
+      if (!label || label.length < 3) return false;
+
+      try {
+        const url = new URL(anchor.href);
+        const host = url.hostname.replace(/^www\./i, '');
+        if (/rewards\.bing\.com|login\.live\.com|account\.microsoft\.com/i.test(url.hostname)) return false;
+        if (/bing\.com$/i.test(host) && !/\/(?:ck\/a|aclick)/i.test(url.pathname)) return false;
+      } catch (error) {
+        return false;
+      }
+
+      return true;
+    });
+  }
+
+  async function browseDestinationPage(options = {}) {
+    if (options.mobile) {
+      applyMobileProfile();
+    }
+
+    dismissBlockingUi();
+    await sleep(randomInt(options.mobile ? 1600 : 1000, options.mobile ? 2600 : 1800));
+
+    const steps = await runVisibleScrollSequence({
+      mobile: Boolean(options.mobile),
+      steps: randomInt(options.mobile ? 8 : 5, options.mobile ? 13 : 8)
+    });
+
+    dismissBlockingUi();
+    return {
+      success: true,
+      mobile: Boolean(options.mobile),
+      steps,
+      url: window.location.href
+    };
+  }
+
+  async function enhancedSearchInteraction(options = {}) {
+    if (options.mobile) {
+      applyMobileProfile();
+    }
+
+    dismissBlockingUi();
+    await sleep(randomInt(options.mobile ? 1400 : 900, options.mobile ? 2400 : 1700));
+
+    const steps = await runVisibleScrollSequence({
+      mobile: Boolean(options.mobile),
+      steps: randomInt(options.mobile ? 7 : 5, options.mobile ? 12 : 8)
+    });
 
     const resultAnchors = Array.from(document.querySelectorAll('#b_results a[href], main a[href], article a[href]'))
       .filter((element) => /^https?:/i.test(element.href || ''))
@@ -572,11 +627,26 @@
       await sleep(randomInt(options.mobile ? 750 : 650, options.mobile ? 1500 : 1200));
     }
 
+    let openedResult = false;
+    let resultUrl = null;
+    if (options.mobile) {
+      const anchor = findSearchResultAnchor();
+      if (anchor) {
+        anchor.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await sleep(randomInt(900, 1700));
+        resultUrl = anchor.href;
+        window.setTimeout(() => window.location.assign(anchor.href), 120);
+        openedResult = true;
+      }
+    }
+
     dismissBlockingUi();
     return {
       success: true,
       mobile: Boolean(options.mobile),
-      steps: scrollPlan.length
+      steps,
+      openedResult,
+      resultUrl
     };
   }
 
@@ -1872,6 +1942,7 @@
   window.__BRA__ = {
     version: VERSION,
     applyMobileProfile,
+    browseDestinationPage,
     collectDashboardTaskLinks,
     collectEnvironmentSnapshot,
     dismissBlockingUi,

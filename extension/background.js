@@ -1348,6 +1348,28 @@ async function waitForTabLoad(tabId, timeoutMs = TAB_LOAD_TIMEOUT_MS) {
   throw new Error(`Timed out waiting for tab ${tabId} to finish loading`);
 }
 
+async function waitForInteractiveLoad(tabId, isMobile, phase) {
+  if (!isMobile) {
+    return waitForTabLoad(tabId);
+  }
+
+  try {
+    return await waitForTabLoad(tabId, 15000);
+  } catch (error) {
+    if (!/Timed out waiting for tab/i.test(String(error?.message || error))) {
+      throw error;
+    }
+
+    const tab = await getTabSafely(tabId);
+    if (!tab) {
+      throw error;
+    }
+
+    log(`[Mobile] ${phase} still loading; continuing visible browsing.`, 'warning');
+    return tab;
+  }
+}
+
 async function injectAutomationFile(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
@@ -1472,11 +1494,33 @@ async function runSingleSearch(keyword, isMobile) {
     }
 
     await waitWithStop(randomInt(...SEARCH_SETTLE_DELAY_MS));
-    await waitForTabLoad(tab.id);
+    await waitForInteractiveLoad(tab.id, isMobile, 'search results');
 
+    if (isMobile) {
+      log('[Mobile] Search submitted; scrolling search results.');
+    }
     const interactionResult = await callAutomationMethod(tab.id, 'enhancedSearchInteraction', [{ mobile: isMobile }]);
     if (!interactionResult?.success) {
       log('[Search] Interaction step returned a non-success result.', 'warning');
+    } else if (isMobile) {
+      log(`[Mobile] Search results engagement: ${interactionResult.steps || 0} scrolls${interactionResult.openedResult ? '; opened result.' : '; no result opened.'}`);
+    }
+
+    if (isMobile && interactionResult?.openedResult) {
+      await waitWithStop(randomInt(1200, 2400));
+      log('[Mobile] Opened a search result; scrolling destination page.');
+      await waitForInteractiveLoad(tab.id, isMobile, 'destination page');
+
+      try {
+        const destinationResult = await callAutomationMethod(tab.id, 'browseDestinationPage', [{ mobile: isMobile }]);
+        if (destinationResult?.success) {
+          log(`[Mobile] Destination engagement: ${destinationResult.steps || 0} scrolls.`);
+        } else {
+          log('[Mobile] Destination engagement could not run; continuing to Rewards check.', 'warning');
+        }
+      } catch (error) {
+        log(`[Mobile] Destination engagement failed: ${error.message}; continuing to Rewards check.`, 'warning');
+      }
     }
 
     await waitWithStop(randomInt(...INTERACTION_SETTLE_DELAY_MS));
@@ -1562,6 +1606,9 @@ async function runSearchAutomation(count, isMobile) {
           branch.executed += 1;
           syncSearchState(branchKey, label);
 
+          if (isMobile) {
+            log('[Mobile] Checking Rewards points after visible browsing.');
+          }
           const verification = await verifySearchOutcome(beforeSnapshot, branchKey, {
             preferredKey,
             label
